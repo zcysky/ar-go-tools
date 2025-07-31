@@ -1,0 +1,405 @@
+## Description
+You are a Golang program summarizer, and your target is to summarize the program’s dataflow fact. Your task is described by follows:
+give you a golang source code function, which may contains parameters and function calls, your task is to identify the dataflow relations between the input and output parameters. Input parameters are often shown as arguments of a function declaration. Your first task is to identify all the input and output parameters, and list them separately. 
+After that, you should read the function body from the source code carefully, if there exists some function calls you cannot find its body, you can infer the desired dataflow by its name. For example, if there is a statement: c=add(a,b), then from the function name you can infer it is the adding function, so you can infer the dataflow will be from a to c and from b to c. Your output will need to be a yaml file format, defined as follows:
+
+```
+dataflow-summaries:
+  - function: "<function name>" # only if it is a function, not a method
+    receiver: "<receiver (struct) name>" # only if it is a struct method, and method must be specified
+    interface: "<interface name>" # only if it is an interface method summary, and method must be specified
+    method: "<method name>" # only for struct method or interface method, and not function
+    flows:
+      - from: "<identify origin of data>"
+        to: "<identify destination of data>"
+      - ...
+    ...
+```
+
+Notice that, when you are writing from and to, you can either use the variable name, or reserved words like "receiver"(indicating the method's receiver), "!arg 0"(indicating the first input parameter, start counting from 0), "!ret 0"(same, indicating the first return parameter). You should first try to use the variable name if it is actually a variable(either for input parameters or output parameters), otherwise you can use the reserved words instead. This rule also works for receivers, which means you should first try to use the receiver's name, then use the reserved word "receiver". 
+here are some examples for what you: 
+## Example 1
+### Input Program: 
+```
+func calculateDiscountPrice(basePrice float64, loyaltyYears int, seasonalMultiplier float64) float64 {
+    // Base loyalty discount: 2% per year up to 25%
+    loyaltyDiscountRate := math.Min(float64(loyaltyYears) * 0.02, 0.25)
+    
+    // Apply seasonal multiplier to the loyalty discount
+    effectiveDiscountRate := loyaltyDiscountRate * seasonalMultiplier
+    
+    discountAmount := basePrice * effectiveDiscountRate
+    finalPrice := basePrice - discountAmount
+    
+    return finalPrice
+}
+```
+
+### output 
+```
+dataflow-summaries:
+    function: "calculateDiscountPrice"
+    flows:
+      - from: "basePrice"
+        to: "finalPrice"
+      - from: "loyaltyYears"
+        to: "finalPrice"
+      - from: "seasonalMultiplier"
+        to: "finalPrice"
+```
+### explanation
+ 1. Program Structure
+- **Input parameters**: basePrice (float64), loyaltyYears (int), seasonalMultiplier (float64)
+- **Output parameter**: finalPrice (float64) as the return value
+- **Receiver**: None (this is a standalone function, not a method)
+
+ 2. Dataflow Explanations
+
+ From "basePrice" to "finalPrice":
+- **Flow path**:
+  1. basePrice is used to calculate discountAmount: `discountAmount := basePrice * effectiveDiscountRate`
+  2. basePrice is directly used in calculating the final output: `finalPrice := basePrice - discountAmount`
+  3. finalPrice is then returned from the function
+
+ From "loyaltyYears" to "finalPrice":
+- **Flow path**:
+  1. loyaltyYears is used to calculate loyaltyDiscountRate: `loyaltyDiscountRate := math.Min(float64(loyaltyYears) * 0.02, 0.25)`
+  2. loyaltyDiscountRate flows into effectiveDiscountRate: `effectiveDiscountRate := loyaltyDiscountRate * seasonalMultiplier`
+  3. effectiveDiscountRate flows into discountAmount: `discountAmount := basePrice * effectiveDiscountRate`
+  4. discountAmount flows into finalPrice: `finalPrice := basePrice - discountAmount`
+  5. finalPrice is then returned from the function
+
+ From "seasonalMultiplier" to "finalPrice":
+- **Flow path**:
+  1. seasonalMultiplier is used to calculate effectiveDiscountRate: `effectiveDiscountRate := loyaltyDiscountRate * seasonalMultiplier`
+  2. effectiveDiscountRate flows into discountAmount: `discountAmount := basePrice * effectiveDiscountRate`
+  3. discountAmount flows into finalPrice: `finalPrice := basePrice - discountAmount`
+  4. finalPrice is then returned from the function
+
+## Example 2
+### Input program: 
+
+```
+func processFinancialData(investmentAmount float64, riskTolerance int, includeTaxImpact bool) (float64, UserInvestment) {
+    // First return value: projectedReturn
+    // Only depends on investmentAmount and riskTolerance
+    baseRate := 0.05 // 5% base return
+    riskMultiplier := float64(riskTolerance) * 0.008
+    projectedReturn := investmentAmount * (baseRate + riskMultiplier)
+    
+    // Second return value: investmentProfile
+    // Depends on riskTolerance and includeTaxImpact (but not investmentAmount)
+    profile := UserInvestment{
+        GrowthRate: baseRate + riskMultiplier,
+        RiskScore:  riskTolerance,
+        ReportDate: time.Now(),
+    }
+    
+    // The includeTaxImpact parameter only affects the profile data
+    if includeTaxImpact {
+        // Apply tax impact calculation to growth rate
+        profile.GrowthRate = profile.GrowthRate * 0.75 // Assuming 25% tax impact
+        profile.RiskScore += 1 // Tax consideration increases risk score
+    }
+    
+    return projectedReturn, profile
+}
+```
+
+### output
+```
+dataflow-summaries:
+function: "processFinancialData"
+flows:
+- from: "investmentAmount"
+  to: "!ret 0"  # projectedReturn is the first return value, can also be used instead
+- from: "riskTolerance"
+  to: "!ret 0"  # projectedReturn is the first return value, can also be used instead
+- from: "riskTolerance"
+  to: "!ret 1"  # UserInvestment is the second return value, can also be used instead
+- from: "includeTaxImpact"
+  to: "!ret 1"  # UserInvestment is the second return value, can also be used instead
+```
+### explanation
+
+ 1. Program Structure
+- **Input parameters**: investmentAmount (float64), riskTolerance (int), includeTaxImpact (bool)
+- **Output parameters**: projectedReturn (float64) and profile (UserInvestment) as return values
+- **Receiver**: None (this is a standalone function)
+
+ 2. Dataflow Explanations
+
+ From "investmentAmount" to "!ret 0" (projectedReturn):
+- **Flow path**:
+  1. investmentAmount is used in calculating the projected return: `projectedReturn := investmentAmount * (baseRate + riskMultiplier)`
+  2. projectedReturn is returned as the first return value in the statement: `return projectedReturn, profile`
+
+ From "riskTolerance" to "!ret 0" (projectedReturn):
+- **Flow path**:
+  1. riskTolerance is used to calculate the risk multiplier: `riskMultiplier := float64(riskTolerance) * 0.008`
+  2. riskMultiplier flows into the projected return calculation: `projectedReturn := investmentAmount * (baseRate + riskMultiplier)`
+  3. projectedReturn is returned as the first return value
+
+ From "riskTolerance" to "!ret 1" (UserInvestment):
+- **Flow path**:
+  1. riskTolerance is used to calculate riskMultiplier: `riskMultiplier := float64(riskTolerance) * 0.008`
+  2. riskMultiplier flows into the GrowthRate field: `GrowthRate: baseRate + riskMultiplier`
+  3. riskTolerance is directly assigned to the RiskScore field: `RiskScore: riskTolerance`
+  4. The profile is returned as the second return value
+
+ From "includeTaxImpact" to "!ret 1" (UserInvestment):
+- **Flow path**:
+  1. includeTaxImpact controls a conditional block that modifies the profile:
+     ```
+     if includeTaxImpact {
+         profile.GrowthRate = profile.GrowthRate * 0.75
+         profile.RiskScore += 1
+     }
+     ```
+  2. The modified profile is returned as the second return value
+
+Note that investmentAmount does not flow to the second return value (UserInvestment) because it's not used in constructing any fields of the UserInvestment struct, as correctly identified by the dataflow analysis.
+
+## Example 3
+
+### input program: 
+```
+func calcLoanTerms(loanAmount float64, annualIncome float64, creditHistory int) (float64, string) {
+    // Calculate adjusted credit score using the helper function
+    adjustedCreditScore := evaluateCreditStrength(creditHistory, annualIncome)
+    
+    // First return value: monthlyPayment
+    // Depends on loanAmount and adjustedCreditScore (which depends on creditHistory and annualIncome)
+    interestRate := 0.05 // Base interest rate of 5%
+    
+    // Adjust interest rate based on credit score
+    if adjustedCreditScore > 700 {
+        interestRate -= 0.01 // Discount for excellent credit
+    } else if adjustedCreditScore < 600 {
+        interestRate += 0.02 // Higher interest for poor credit
+    }
+    
+    // Calculate monthly payment based on a 30-year mortgage formula
+    loanTermMonths := 30 * 12
+    monthlyRate := interestRate / 12
+    monthlyPayment := loanAmount * monthlyRate * math.Pow(1+monthlyRate, float64(loanTermMonths)) / 
+                     (math.Pow(1+monthlyRate, float64(loanTermMonths)) - 1)
+    
+    // Second return value: borrowerCategory
+    // Depends on annualIncome and adjustedCreditScore (but NOT directly on loanAmount)
+    var borrowerCategory string
+    
+    // Determine borrower category based on income and credit
+    debtToIncomeRatio := (monthlyPayment * 12) / annualIncome
+    
+    if adjustedCreditScore > 720 && debtToIncomeRatio < 0.28 {
+        borrowerCategory = "Prime Plus"
+    } else if adjustedCreditScore > 680 && debtToIncomeRatio < 0.36 {
+        borrowerCategory = "Prime"
+    } else if adjustedCreditScore > 620 && debtToIncomeRatio < 0.43 {
+        borrowerCategory = "Standard"
+    } else {
+        borrowerCategory = "Subprime"
+    }
+    
+    return monthlyPayment, borrowerCategory
+}
+```
+### output
+```
+dataflow-summaries:function: "calcLoanTerms"
+    flows:
+        - from: "loanAmount"
+            to: "monthlyPayment"
+
+
+        - from: "adjustedCreditScore"
+            to: "monthlyPayment"
+
+        - from: "annualIncome"
+            to: "borrowerCategory"
+
+        - from: "adjustedCreditScore"
+            to: "borrowerCategory"
+```
+### explanation
+Dataflow Analysis of calcLoanTerms Function
+
+ 1. Program Structure
+- **Input parameters**: loanAmount (float64), annualIncome (float64), creditHistory (int)
+- **Output parameters**: monthlyPayment (float64) and borrowerCategory (string) as return values
+- **Receiver**: None (this is a standalone function)
+
+ 2. Dataflow Explanations
+
+ From "loanAmount" to "monthlyPayment":
+- **Flow path**:
+  1. loanAmount is directly used in calculating the monthly payment:
+     ```go
+     monthlyPayment := loanAmount * monthlyRate * math.Pow(1+monthlyRate, float64(loanTermMonths)) / 
+                      (math.Pow(1+monthlyRate, float64(loanTermMonths)) - 1)
+     ```
+  2. monthlyPayment is returned as the first return value
+
+ From "adjustedCreditScore" to "monthlyPayment":
+- **Flow path**:
+  1. adjustedCreditScore affects the interest rate through conditional statements:
+     ```go
+     if adjustedCreditScore > 700 {
+         interestRate -= 0.01 // Discount for excellent credit
+     } else if adjustedCreditScore < 600 {
+         interestRate += 0.02 // Higher interest for poor credit
+     }
+     ```
+  2. interestRate flows into monthlyRate: `monthlyRate := interestRate / 12`
+  3. monthlyRate is used to calculate monthlyPayment
+  4. monthlyPayment is returned as the first return value
+
+ From "annualIncome" to "borrowerCategory":
+- **Flow path**:
+  1. annualIncome is used in calculating the debt-to-income ratio:
+     ```go
+     debtToIncomeRatio := (monthlyPayment * 12) / annualIncome
+     ```
+  2. debtToIncomeRatio is used in the conditional logic that determines borrowerCategory:
+     ```go
+     if adjustedCreditScore > 720 && debtToIncomeRatio < 0.28 {
+         borrowerCategory = "Prime Plus"
+     } else if...
+     ```
+  3. borrowerCategory is returned as the second return value
+
+ From "adjustedCreditScore" to "borrowerCategory":
+- **Flow path**:
+  1. adjustedCreditScore is directly used in the conditional statements that determine borrowerCategory:
+     ```go
+     if adjustedCreditScore > 720 && debtToIncomeRatio < 0.28 {
+         borrowerCategory = "Prime Plus"
+     } else if adjustedCreditScore > 680 && debtToIncomeRatio < 0.36 {
+         borrowerCategory = "Prime"
+     } else if...
+     ```
+  2. borrowerCategory is returned as the second return value
+
+Note: While not explicitly shown in the dataflow summary, there are also indirect flows - for example, loanAmount indirectly affects borrowerCategory through its influence on monthlyPayment and subsequently debtToIncomeRatio. Additionally, both creditHistory and annualIncome contribute to adjustedCreditScore through the evaluateCreditStrength helper function.
+
+
+## Example 4:
+### input program
+```
+func (s *CertPool) AppendCertsFromPEM(pemCerts []byte) (ok bool) {
+    for len(pemCerts) > 0 {
+        var block *pem.Block
+        block, pemCerts = pem.Decode(pemCerts)
+        if block == nil {
+            break
+        }
+        if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+            continue
+        }
+
+        certBytes := block.Bytes
+        cert, err := ParseCertificate(certBytes)
+        if err != nil {
+            continue
+        }
+        var lazyCert struct {
+            sync.Once
+            v *Certificate
+        }
+        s.addCertFunc(sha256.Sum224(cert.Raw), string(cert.RawSubject), func() (*Certificate, error) {
+            lazyCert.Do(func() {
+                // This can't fail, as the same bytes already parsed above.
+                lazyCert.v, _ = ParseCertificate(certBytes)
+                certBytes = nil
+            })
+            return lazyCert.v, nil
+        }, nil)
+        ok = true
+    }
+
+    return ok
+}
+```
+### output
+```
+dataflow-summaries:
+  - receiver: "CertPool"
+    method: "AppendCertsFromPEM"
+    flows:
+      - from: "pemCerts"
+        to: "s"
+      - from: "pemCerts"
+        to: "ok"
+      - from: "s"
+        to: "ok"
+      - from: "s"
+        to: "s"
+```
+
+### explanation
+
+Dataflow Analysis of CertPool.AppendCertsFromPEM Method
+
+ 1. Program Structure
+- **Receiver**: CertPool struct (referenced as "s")
+- **Method**: AppendCertsFromPEM
+- **Input parameter**: pemCerts ([]byte) - PEM encoded certificate data
+- **Output parameter**: ok (bool) - indicates success if at least one certificate was added
+
+ 2. Dataflow Explanations
+
+ From "pemCerts" to "s":
+- **Flow path**:
+  1. pemCerts is iteratively processed in the for loop: `for len(pemCerts) > 0`
+  2. Each PEM block is decoded: `block, pemCerts = pem.Decode(pemCerts)`
+  3. Valid certificate blocks have their bytes extracted: `certBytes := block.Bytes`
+  4. The certificate is parsed: `cert, err := ParseCertificate(certBytes)`
+  5. For valid certificates, they're added to the receiver's state through `s.addCertFunc()`:
+     ```go
+     s.addCertFunc(sha256.Sum224(cert.Raw), string(cert.RawSubject), func() (*Certificate, error) {
+         // Lazy loading function
+     }, nil)
+     ```
+  6. This modifies the state of the CertPool receiver "s" by adding new certificates
+
+ From "pemCerts" to "ok":
+- **Flow path**:
+  1. When a valid certificate block is found in pemCerts and processed successfully, the code sets: `ok = true`
+  2. The final value of "ok" is determined by whether any valid certificates were found in pemCerts
+  3. The return value is affected by the content of the input: `return ok`
+
+ From "s" to "ok":
+- **Flow path**:
+  1. The receiver "s" provides the `addCertFunc` method used to add certificates
+  2. When a certificate is successfully added to "s", the code sets: `ok = true`
+  3. If "s" is in a state that prevents certificates from being added, "ok" might remain false
+  4. Therefore, the state of "s" influences the value of "ok"
+
+ From "s" to "s":
+- **Flow path**:
+  1. This is a self-modifying flow where the receiver modifies its own state
+  2. The existing state of "s" is accessed and modified by the `s.addCertFunc()` call:
+     ```go
+     s.addCertFunc(sha256.Sum224(cert.Raw), string(cert.RawSubject), func() (*Certificate, error) {
+         // Function that modifies s's internal state
+     }, nil)
+     ```
+  3. This represents a state transformation where the CertPool is updated with new certificates
+
+The method uses a lazy-loading pattern with `sync.Once` to ensure each certificate is only fully parsed when needed, making the code more efficient by deferring the expensive parsing operation until necessary.
+
+### Summary & Task
+
+From the provided example, you can find that we have the following requirements or settings:
+- we may not provide the type definition used in this function, you will figure it out by yourself
+- we may not provide the callee function’s definition and function body, you will guess the dataflow from the function name and parameters it takes.
+- You should try to iterate from the receiver, each input parameter, each output parameter, and how the data will flow between them. Please notice an input parameter can also be flowed to.
+- If the function has receiver, it will be viewed as the first input parameter and first output parameter. In this situation, please be careful about the dataflows between receivers and normal arguments. 
+- Do not forget to analyze the dataflows between input parameters, and dataflows from the receiver to other parameters.
+- If you are not sure about some result, just try to be preservative. These dataflow relations are used to detect taint dataflows, so if you are not sure about some dataflow, just assume it exists, but still try to be as precise as possible under the preservation requirement.
+- Ignore any global variables (if presented in the program).
+
+You should first assume the most general dataflows, that is, every input parameter(including the receiver) can flow to every input parameter and output parameter. Then you should try to reduce some unrealizable dataflows. If you are not sure if some dataflow is realizable or not, you can just keep it.
+
+Now, the function you need to analyze is as follows. You can output your intermediate results, but in the end please strictly follow the output format. 

@@ -233,13 +233,17 @@ func RunIntraProcedural(a *State, sm *SummaryGraph) (time.Duration, error) {
 				formatutil.Sanitize(sm.Parent.String()))
 		}
 
-		// Build full graph as replacement
-		start := time.Now()
-		sm.BuildFullFlowGraph()
-		sm.Constructed = true
-		elapsed := time.Since(start)
-
-		return elapsed, nil
+		// Fallback: Use LLM to generate summary
+		llmSummary, err := GetLLMSummary(ctx, sm.Parent, "analysis/llm/prompt.txt", "anthropic.claude-v2")
+		if err != nil {
+			if a.Logger != nil {
+				a.Logger.Warnf("LLM fallback failed: %v", err)
+			}
+			return 0, err
+		}
+		// Replace the current summary with the LLM-generated one
+		*sm = *llmSummary
+		return 0, nil
 	}
 }
 
