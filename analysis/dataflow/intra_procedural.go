@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"go/types"
+	"strings"
 	"time"
 
 	"github.com/awslabs/ar-go-tools/analysis/defers"
@@ -753,6 +754,443 @@ func (state *IntraAnalysisState) isCapturedBy(value ssa.Value) []*pointer.Label 
 		}
 	}
 	return maps
+}
+
+// ============================================================================
+// Immutable Analysis Part
+// ============================================================================
+
+// ImmutableAnalysisResult contains the results of analyzing which parameters are immutable
+type ImmutableAnalysisResult struct {
+	IsSatisfied  bool             // Whether the immutable condition is satisfied
+	NoLHSParams  []*ssa.Parameter // Parameters that should never appear on LHS
+	NoRHSParams  []*ssa.Parameter // Parameters that should never appear on RHS
+	NoFlowParams []*ssa.Parameter // Parameters that should have no flows at all
+}
+
+// IsSpecSatisfyImmutable checks if the summary satisfies the immutable specification
+// by comparing it against a full flow summary where every parameter can flow to every other parameter and return
+func IsSpecSatisfyImmutable(summaryUnderCheck *SummaryGraph) ImmutableAnalysisResult {
+	result := ImmutableAnalysisResult{
+		IsSatisfied:  false,
+		NoLHSParams:  []*ssa.Parameter{},
+		NoRHSParams:  []*ssa.Parameter{},
+		NoFlowParams: []*ssa.Parameter{},
+	}
+
+	if summaryUnderCheck == nil || summaryUnderCheck.Parent == nil {
+		return result
+	}
+
+	// Create a full flow summary where every parameter can flow to every other parameter and return
+	fullFlowSummary := createFullFlowSummary(summaryUnderCheck)
+	if fullFlowSummary == nil {
+		return result
+	}
+
+	// Compare the summaries to find missing flows
+	missingFlows := findMissingFlows(summaryUnderCheck, fullFlowSummary)
+
+	// Categorize the missing flows to see if they fit the immutable pattern
+	if categorizeImmutableFlows(summaryUnderCheck, missingFlows, &result) {
+		result.IsSatisfied = true
+	}
+
+	return result
+}
+
+// CheckParametersImmutableInSSA verifies that the identified immutable parameters
+// don't actually appear in SSA instructions where they shouldn't
+func CheckParametersImmutableInSSA(result ImmutableAnalysisResult, function *ssa.Function) (bool, string) {
+	if !result.IsSatisfied {
+		return false, "immutable analysis not satisfied"
+	}
+
+	// Create sets for efficient lookup
+	noLHSSet := make(map[*ssa.Parameter]bool)
+	for _, param := range result.NoLHSParams {
+		noLHSSet[param] = true
+	}
+
+	noRHSSet := make(map[*ssa.Parameter]bool)
+	for _, param := range result.NoRHSParams {
+		noRHSSet[param] = true
+	}
+
+	noFlowSet := make(map[*ssa.Parameter]bool)
+	for _, param := range result.NoFlowParams {
+		noFlowSet[param] = true
+	}
+
+	// Iterate through all instructions in the function
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			// Check if parameters appear where they shouldn't
+
+			// Check LHS (assignment targets) - these are instructions that define values
+			if value, ok := instr.(ssa.Value); ok {
+				// If this instruction defines a value that's a parameter that should never be on LHS
+				if param, isParam := value.(*ssa.Parameter); isParam && noLHSSet[param] {
+					return false, fmt.Sprintf("no-LHS parameter %s appears on LHS but should not", param.Name())
+				}
+				if param, isParam := value.(*ssa.Parameter); isParam && noFlowSet[param] {
+					return false, fmt.Sprintf("no-flow parameter %s appears in instruction", param.Name())
+				}
+			}
+
+			// Check RHS (operands/sources)
+			var operands []*ssa.Value
+			operands = instr.Operands(operands)
+			for _, operand := range operands {
+				if operand != nil {
+					if param, isParam := (*operand).(*ssa.Parameter); isParam {
+						// NoFlowParams should never appear anywhere
+						if noFlowSet[param] {
+							return false, fmt.Sprintf("no-flow parameter %s appears as operand", param.Name())
+						}
+						// NoLHSParams can appear as operands for operations like pointer dereferencing
+						// They just shouldn't appear as sources in dataflows
+						// NoRHSParams can appear as operands - they just never appear as targets in flows
+					}
+				}
+			}
+		}
+	}
+
+	return true, "all immutable parameters verified in SSA"
+}
+
+// createFullFlowSummary creates a summary where every parameter flows to every other parameter and return
+func createFullFlowSummary(original *SummaryGraph) *SummaryGraph {
+	if original == nil || original.Parent == nil {
+		return nil
+	}
+
+	// Create a simple summary structure
+	fullSummary := &SummaryGraph{
+		ID:      original.ID,
+		Parent:  original.Parent,
+		Params:  make(map[ssa.Node]*ParamNode),
+		Returns: make(map[ssa.Instruction][]*ReturnValNode),
+	}
+
+	// Copy parameters
+	for node, paramNode := range original.Params {
+		newParamNode := &ParamNode{
+			id:      paramNode.id,
+			parent:  fullSummary,
+			ssaNode: paramNode.ssaNode,
+			argPos:  paramNode.argPos,
+			out:     make(map[GraphNode][]EdgeInfo),
+			in:      make(map[GraphNode]EdgeInfo),
+		}
+		fullSummary.Params[node] = newParamNode
+	}
+
+	// Copy returns
+	for instr, returnNodes := range original.Returns {
+		newReturnNodes := make([]*ReturnValNode, len(returnNodes))
+		for i, retNode := range returnNodes {
+			if retNode != nil {
+				newRetNode := &ReturnValNode{
+					id:     retNode.id,
+					parent: fullSummary,
+					index:  retNode.index,
+					in:     make(map[GraphNode]EdgeInfo),
+					out:    make(map[GraphNode][]EdgeInfo),
+				}
+				newReturnNodes[i] = newRetNode
+			}
+		}
+		fullSummary.Returns[instr] = newReturnNodes
+	}
+
+	// Create full connectivity: every parameter flows to every other parameter and return
+	allTargets := []GraphNode{}
+
+	// Add all parameters as targets
+	for _, paramNode := range fullSummary.Params {
+		allTargets = append(allTargets, paramNode)
+	}
+
+	// Add all return nodes as targets
+	for _, returnNodes := range fullSummary.Returns {
+		for _, retNode := range returnNodes {
+			if retNode != nil {
+				allTargets = append(allTargets, retNode)
+			}
+		}
+	}
+
+	// Create edges from every parameter to every target (including other parameters and returns)
+	for _, sourceParam := range fullSummary.Params {
+		for _, target := range allTargets {
+			if sourceParam != target { // Avoid self-loops
+				edgeInfo := EdgeInfo{
+					RelPath: map[string]map[string]bool{"*": {"": true}},
+					Index:   0,
+					Cond:    nil,
+				}
+				sourceParam.out[target] = []EdgeInfo{edgeInfo}
+				target.In()[sourceParam] = edgeInfo
+			}
+		}
+	}
+
+	return fullSummary
+}
+
+// findMissingFlows identifies flows that exist in the full summary but not in the summary under check
+func findMissingFlows(summaryUnderCheck, fullFlowSummary *SummaryGraph) map[string]bool {
+	missingFlows := make(map[string]bool)
+
+	// Get flows from both summaries
+	actualFlows := extractParameterFlows(summaryUnderCheck)
+	fullFlows := extractParameterFlows(fullFlowSummary)
+
+	// Find flows that exist in full but not in actual
+	for flow := range fullFlows {
+		if !actualFlows[flow] {
+			missingFlows[flow] = true
+		}
+	}
+
+	return missingFlows
+}
+
+// extractParameterFlows extracts parameter-to-parameter and parameter-to-return flows
+func extractParameterFlows(summary *SummaryGraph) map[string]bool {
+	flows := make(map[string]bool)
+
+	if summary == nil {
+		return flows
+	}
+
+	for _, paramNode := range summary.Params {
+		// Check direct outgoing flows
+		for target := range paramNode.Out() {
+			// Only consider flows to parameters and returns
+			switch target.(type) {
+			case *ParamNode, *ReturnValNode:
+				flowKey := fmt.Sprintf("%s -> %s", paramNode.String(), target.String())
+				flows[flowKey] = true
+			}
+		}
+	}
+
+	return flows
+}
+
+// categorizeImmutableFlows analyzes missing flows to see if they fit immutable patterns
+func categorizeImmutableFlows(summary *SummaryGraph, missingFlows map[string]bool, result *ImmutableAnalysisResult) bool {
+
+	if len(missingFlows) == 0 {
+		return true // No missing flows means it's already complete
+	}
+
+	// Track which parameters appear as sources or targets in actual flows
+	paramsAsSource := make(map[*ssa.Parameter]bool)
+	paramsAsTarget := make(map[*ssa.Parameter]bool)
+	paramsUsedInSSA := make(map[*ssa.Parameter]bool)
+	allParams := make(map[*ssa.Parameter]bool)
+
+	// Initialize all parameters
+	for _, paramNode := range summary.Params {
+		param := paramNode.SsaNode()
+		allParams[param] = true
+	}
+
+	// Check SSA instructions to see which parameters are actually used
+	if summary.Parent != nil {
+		for _, block := range summary.Parent.Blocks {
+			for _, instr := range block.Instrs {
+				// Check operands (RHS usage)
+				var operands []*ssa.Value
+				operands = instr.Operands(operands)
+				for _, operand := range operands {
+					if operand != nil {
+						if param, isParam := (*operand).(*ssa.Parameter); isParam {
+							paramsUsedInSSA[param] = true
+						}
+					}
+				}
+
+				// Check if the instruction defines a parameter (unusual but possible)
+				if value, ok := instr.(ssa.Value); ok {
+					if param, isParam := value.(*ssa.Parameter); isParam {
+						paramsUsedInSSA[param] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Check actual flows in the summary to categorize parameter usage
+	actualFlows := extractParameterFlows(summary)
+
+	for flow := range actualFlows {
+		parts := parseFlowString(flow)
+		if len(parts) != 2 {
+			continue
+		}
+
+		sourceParam := findParameterByString(summary, parts[0])
+		targetParam := findParameterByString(summary, parts[1])
+
+		if sourceParam != nil {
+			paramsAsSource[sourceParam] = true
+		}
+		if targetParam != nil {
+			paramsAsTarget[targetParam] = true
+		}
+	}
+
+	// Check missing flows to detect mutual parameter flow (indicating mutability)
+	// Only mark a parameter as target if there's actual evidence of mutual flow
+	for flow := range missingFlows {
+		parts := parseFlowString(flow)
+		if len(parts) != 2 {
+			continue
+		}
+
+		sourceParam := findParameterByString(summary, parts[0])
+		targetParam := findParameterByString(summary, parts[1])
+
+		// Only mark as target if BOTH parameters appear as sources AND
+		// there are actual flows between parameters (not just to returns)
+		if sourceParam != nil && targetParam != nil &&
+			paramsAsSource[sourceParam] && paramsAsSource[targetParam] {
+
+			// Check if there are any actual parameter-to-parameter flows
+			hasParamToParamFlow := false
+			for actualFlow := range actualFlows {
+				actualParts := parseFlowString(actualFlow)
+				if len(actualParts) == 2 {
+					actualSourceParam := findParameterByString(summary, actualParts[0])
+					actualTargetParam := findParameterByString(summary, actualParts[1])
+					if actualSourceParam != nil && actualTargetParam != nil {
+						hasParamToParamFlow = true
+						break
+					}
+				}
+			}
+
+			// Only mark as target if there are actual parameter-to-parameter flows
+			// This indicates true mutability, not just source-only parameters
+			if hasParamToParamFlow {
+				paramsAsTarget[targetParam] = true
+			}
+		}
+	}
+
+	// Categorize parameters based on their usage patterns
+	neverSourceParams := make(map[*ssa.Parameter]bool) // NoLHSParams - never appear as sources
+	neverTargetParams := make(map[*ssa.Parameter]bool) // NoRHSParams - never appear as targets
+	neverUsedParams := make(map[*ssa.Parameter]bool)   // NoFlowParams - never appear in any flows
+
+	for param := range allParams {
+		isSource := paramsAsSource[param]
+		isTarget := paramsAsTarget[param]
+		usedInSSA := paramsUsedInSSA[param]
+
+		if !usedInSSA {
+			// Parameter is never used in SSA instructions at all
+			neverUsedParams[param] = true
+		} else if !isSource && !isTarget {
+			// Parameter is used in SSA but doesn't participate in parameter flows
+			// This likely means it's target-only (like pointer parameters being written to)
+			neverSourceParams[param] = true
+		} else if isTarget && !isSource {
+			// Parameter only appears as target in flows, never as source
+			neverSourceParams[param] = true
+		} else if isSource && !isTarget {
+			// Parameter only appears as source in flows, never as target
+			neverTargetParams[param] = true
+		} else if isSource && isTarget {
+			// Parameter appears as both source and target, it's mutable (not immutable)
+			return false
+		}
+	}
+
+	// Check if all missing flows can be explained by immutable patterns
+	for flow := range missingFlows {
+		parts := parseFlowString(flow)
+		if len(parts) != 2 {
+			return false // Invalid flow string
+		}
+
+		sourceParam := findParameterByString(summary, parts[0])
+		targetParam := findParameterByString(summary, parts[1])
+		isReturnFlow := strings.Contains(parts[1], "return")
+
+		// Check if this missing flow fits an immutable pattern
+		validImmutableFlow := false
+
+		// Case 1: Source parameter never flows anywhere (never-source/never-used)
+		if sourceParam != nil && (neverSourceParams[sourceParam] || neverUsedParams[sourceParam]) {
+			validImmutableFlow = true
+		}
+
+		// Case 2: Target parameter is never flowed to (never-target/never-used)
+		if targetParam != nil && (neverTargetParams[targetParam] || neverUsedParams[targetParam]) {
+			validImmutableFlow = true
+		}
+
+		// Case 3: Flow to return from parameters that are never sources or never used
+		if isReturnFlow && sourceParam != nil && (neverSourceParams[sourceParam] || neverUsedParams[sourceParam]) {
+			validImmutableFlow = true
+		}
+
+		if !validImmutableFlow {
+			return false // This missing flow doesn't fit immutable patterns
+		}
+	}
+
+	// Fill in the result with categorized parameters
+	for param := range neverSourceParams {
+		result.NoLHSParams = append(result.NoLHSParams, param)
+	}
+
+	for param := range neverTargetParams {
+		result.NoRHSParams = append(result.NoRHSParams, param)
+	}
+
+	for param := range neverUsedParams {
+		result.NoFlowParams = append(result.NoFlowParams, param)
+	}
+
+	return true
+}
+
+// parseFlowString parses a flow string like "param1 -> param2" into [source, target]
+func parseFlowString(flow string) []string {
+	parts := strings.Split(flow, " -> ")
+	if len(parts) != 2 {
+		return []string{}
+	}
+	return []string{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])}
+}
+
+// findParameterByString finds a parameter node by its string representation
+func findParameterByString(summary *SummaryGraph, nodeStr string) *ssa.Parameter {
+	for _, paramNode := range summary.Params {
+		// Check if the node string exactly matches the parameter node string
+		if paramNode.String() == nodeStr {
+			return paramNode.SsaNode()
+		}
+
+		// More precise parameter matching using the parameter name and position
+		if strings.Contains(nodeStr, "parameter") {
+			paramName := paramNode.SsaNode().Name()
+			// Look for the parameter name followed by " : " (parameter type separator)
+			// or parameter name followed by " of " (parameter of function)
+			if strings.Contains(nodeStr, "parameter "+paramName+" :") ||
+				strings.Contains(nodeStr, "parameter "+paramName+" of") {
+				return paramNode.SsaNode()
+			}
+		}
+	}
+	return nil
 }
 
 // ShouldBuildSummary returns true if the function's summary should be *built* during the single function analysis

@@ -825,6 +825,18 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 	function *ssa.Function,
 	summaryUnderCheck *SummaryGraph) (bool, string, map[*ssa.Function]*SummaryGraph) {
 
+	// check if the spec can be proved by a simple analysis
+	// case 1: contains only no-read/no-write spec
+	if result := IsSpecSatisfyImmutable(summaryUnderCheck); result.IsSatisfied {
+		// Targeted SSA verification - much faster than checking all parameters
+		if isValid, reason := CheckParametersImmutableInSSA(result, function); !isValid {
+			return false, fmt.Sprintf("Immutable analysis failed: %s", reason), nil
+		}
+
+		summaryUnderCheck.IsSound = true
+		return true, "Summary is sound: immutable parameters confirmed", nil
+	}
+
 	// Clone the summary-under-check to avoid modifying the original
 	Su := summaryUnderCheck
 	// Create a most-general summary (Sg) where every callee function has maximum dataflows

@@ -552,6 +552,216 @@ func TestFunctionSummaries(t *testing.T) {
 	}
 }
 
+// TestImmutableAnalysis tests the immutable parameter analysis feature
+func TestImmutableAnalysis(t *testing.T) {
+	dir := filepath.Join("testdata", "immutable")
+	lp, err := analysistest.LoadTest(
+		testfsys, dir, []string{}, analysistest.LoadTestOptions{ApplyRewrite: true}).Value()
+	if err != nil {
+		t.Fatalf("failed to load test: %v", err)
+	}
+
+	state, err := result.Bind(ptr.NewState(lp), dataflow.NewState).Value()
+	if err != nil {
+		t.Fatalf("failed to build analyzer state: %v", err)
+	}
+
+	numRoutines := runtime.NumCPU() - 1
+	if numRoutines <= 0 {
+		numRoutines = 1
+	}
+
+	// Run intra-procedural analysis to build summaries
+	dataflow.RunIntraProceduralPass(state, numRoutines, dataflow.IntraAnalysisParams{
+		ShouldBuildSummary: dataflow.ShouldBuildSummary,
+		ShouldTrack:        dataflow.IsNodeOfInterest,
+	})
+
+	if len(state.FlowGraph.Summaries) == 0 {
+		t.Fatalf("analyzer state does not contain any summaries")
+	}
+
+	// Test each function's immutable analysis results
+	for function, summary := range state.FlowGraph.Summaries {
+		functionName := function.Name()
+
+		// Skip main and other non-test functions
+		if functionName == "main" || functionName == "init" {
+			continue
+		}
+
+		t.Run(functionName, func(t *testing.T) {
+			// Run the immutable analysis
+			result := dataflow.IsSpecSatisfyImmutable(summary)
+
+			// Test specific expected outcomes
+			switch functionName {
+			case "UnusedParams":
+				// All parameters should be unused (NoFlowParams)
+				if !result.IsSatisfied {
+					t.Errorf("UnusedParams should satisfy immutable spec")
+				}
+				if len(result.NoFlowParams) != 3 {
+					t.Errorf("UnusedParams should have 3 no-flow params, got %d", len(result.NoFlowParams))
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("UnusedParams SSA check failed: %s", reason)
+				}
+
+			case "OnlySourceParams":
+				// Parameters should only appear on RHS (as sources)
+				if !result.IsSatisfied {
+					t.Errorf("OnlySourceParams should satisfy immutable spec")
+				}
+				if len(result.NoRHSParams) != 2 {
+					t.Errorf("OnlySourceParams should have 2 no-RHS params, got %d", len(result.NoRHSParams))
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("OnlySourceParams SSA check failed: %s", reason)
+				}
+
+			case "OnlyTargetParams":
+				// In Go SSA form, parameters are read-only, so discarded parameters become NoFlow
+				if !result.IsSatisfied {
+					t.Errorf("OnlyTargetParams should satisfy immutable spec")
+				}
+				if len(result.NoFlowParams) != 2 {
+					t.Errorf("OnlyTargetParams should have 2 no-flow params (a,b), got %d", len(result.NoFlowParams))
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("OnlyTargetParams SSA check failed: %s", reason)
+				}
+
+			case "MutableParams":
+				// Parameters that flow to multiple return values (both as sources)
+				if !result.IsSatisfied {
+					t.Errorf("MutableParams should satisfy immutable spec (both params only sources)")
+				}
+				if len(result.NoRHSParams) != 2 {
+					t.Errorf("MutableParams should have 2 no-RHS params, got %d", len(result.NoRHSParams))
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("MutableParams SSA check failed: %s", reason)
+				}
+
+			case "UnusedWithReturn":
+				// Parameter is unused
+				if !result.IsSatisfied {
+					t.Errorf("UnusedWithReturn should satisfy immutable spec")
+				}
+				if len(result.NoFlowParams) != 1 {
+					t.Errorf("UnusedWithReturn should have 1 no-flow param, got %d", len(result.NoFlowParams))
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("UnusedWithReturn SSA check failed: %s", reason)
+				}
+
+			case "NoParams":
+				// No parameters, should be satisfied trivially
+				if !result.IsSatisfied {
+					t.Errorf("NoParams should satisfy immutable spec (no parameters)")
+				}
+				if len(result.NoFlowParams) != 0 && len(result.NoLHSParams) != 0 && len(result.NoRHSParams) != 0 {
+					t.Errorf("NoParams should have empty parameter lists")
+				}
+
+			case "SingleParam":
+				// Single parameter used normally - should be RHS only
+				if !result.IsSatisfied {
+					t.Errorf("SingleParam should satisfy immutable spec")
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("SingleParam SSA check failed: %s", reason)
+				}
+
+			case "IndirectFlow":
+				// 'source' flows indirectly, 'unused' doesn't flow
+				if !result.IsSatisfied {
+					t.Errorf("IndirectFlow should satisfy immutable spec")
+				}
+				// Should have at least one no-flow param (unused)
+				if len(result.NoFlowParams) == 0 {
+					t.Errorf("IndirectFlow should have at least 1 no-flow param")
+				}
+				// Verify SSA check passes
+				if valid, reason := dataflow.CheckParametersImmutableInSSA(result, function); !valid {
+					t.Errorf("IndirectFlow SSA check failed: %s", reason)
+				}
+			}
+
+			// Log results for debugging
+			t.Logf("Function %s: IsSatisfied=%v, NoFlow=%d, NoLHS=%d, NoRHS=%d",
+				functionName, result.IsSatisfied, len(result.NoFlowParams), len(result.NoLHSParams), len(result.NoRHSParams))
+		})
+	}
+}
+
+// TestImmutableAnalysisIntegration tests the integration with soundness checking
+func TestImmutableAnalysisIntegration(t *testing.T) {
+	dir := filepath.Join("testdata", "immutable")
+	lp, err := analysistest.LoadTest(
+		testfsys, dir, []string{}, analysistest.LoadTestOptions{ApplyRewrite: true}).Value()
+	if err != nil {
+		t.Fatalf("failed to load test: %v", err)
+	}
+
+	state, err := result.Bind(ptr.NewState(lp), dataflow.NewState).Value()
+	if err != nil {
+		t.Fatalf("failed to build analyzer state: %v", err)
+	}
+
+	numRoutines := runtime.NumCPU() - 1
+	if numRoutines <= 0 {
+		numRoutines = 1
+	}
+
+	// Run intra-procedural analysis
+	dataflow.RunIntraProceduralPass(state, numRoutines, dataflow.IntraAnalysisParams{
+		ShouldBuildSummary: dataflow.ShouldBuildSummary,
+		ShouldTrack:        dataflow.IsNodeOfInterest,
+	})
+
+	// Build inter-procedural graph to test soundness checking integration
+	state.FlowGraph.BuildGraph()
+
+	// Test the integration by checking soundness for functions with immutable parameters
+	for function, summary := range state.FlowGraph.Summaries {
+		functionName := function.Name()
+
+		// Test functions that should benefit from immutable optimization
+		if functionName == "UnusedParams" || functionName == "UnusedWithReturn" {
+			t.Run(functionName+"_Integration", func(t *testing.T) {
+				// This should trigger the immutable analysis optimization in CheckSummarySoundness
+				isSound, reason, needsDeeperCheck := state.FlowGraph.CheckSummarySoundness(function, summary)
+
+				// Should be sound due to immutable optimization
+				if !isSound {
+					t.Errorf("Function %s should be sound via immutable optimization, but got: %s", functionName, reason)
+				}
+
+				// Should not need deeper analysis since immutable analysis handled it
+				if len(needsDeeperCheck) != 0 {
+					t.Errorf("Function %s should not need deeper analysis via immutable optimization, but got %d callees to check",
+						functionName, len(needsDeeperCheck))
+				}
+
+				// Verify the reason mentions immutable
+				if !strings.Contains(reason, "immutable") && !strings.Contains(reason, "parameters confirmed") {
+					t.Errorf("Soundness reason should mention immutable analysis: %s", reason)
+				}
+
+				t.Logf("Function %s soundness: %v, reason: %s", functionName, isSound, reason)
+			})
+		}
+	}
+}
+
 // test some methods that are meant to be nil-safe
 func TestStringNilSafety(t *testing.T) {
 	var gr *dataflow.SummaryGraph
