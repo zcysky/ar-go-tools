@@ -826,7 +826,7 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 	summaryUnderCheck *SummaryGraph) (bool, string, map[*ssa.Function]*SummaryGraph) {
 
 	// Case 0: Easiest case - if Su == Sg, trivially sound
-	Sg := g.createMostGeneralSummary(function)
+	Sg := createFullFlowSummary(summaryUnderCheck)
 	if g.compareSummaries(summaryUnderCheck, Sg) {
 		summaryUnderCheck.IsSound = true
 		return true, "Summary is sound: already equivalent to full flow summary", nil
@@ -849,6 +849,8 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 		summaryUnderCheck.IsSound = true
 		return true, "Summary is sound: subset of reaching-definition analysis", nil
 	}
+
+	// Case 3: Intra-procedural analysis by generating subspec
 
 	// Clone the summary-under-check to avoid modifying the original
 	Su := summaryUnderCheck
