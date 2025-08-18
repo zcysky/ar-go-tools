@@ -825,22 +825,34 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 	function *ssa.Function,
 	summaryUnderCheck *SummaryGraph) (bool, string, map[*ssa.Function]*SummaryGraph) {
 
-	// check if the spec can be proved by a simple analysis
-	// case 1: contains only no-read/no-write spec
-	if result := IsSpecSatisfyImmutable(summaryUnderCheck); result.IsSatisfied {
+	// Case 0: Easiest case - if Su == Sg, trivially sound
+	Sg := g.createMostGeneralSummary(function)
+	if g.compareSummaries(summaryUnderCheck, Sg) {
+		summaryUnderCheck.IsSound = true
+		return true, "Summary is sound: already equivalent to full flow summary", nil
+	}
+
+	// Case 1: immutable analysis - check if the spec can be proved by a simple analysis
+	if result := IsSpecSatisfyimmutable(summaryUnderCheck); result.IsSatisfied {
 		// Targeted SSA verification - much faster than checking all parameters
-		if isValid, reason := CheckParametersImmutableInSSA(result, function); !isValid {
-			return false, fmt.Sprintf("Immutable analysis failed: %s", reason), nil
+		if isValid, reason := CheckParametersimmutableInSSA(result, function); !isValid {
+			return false, fmt.Sprintf("immutable analysis failed: %s", reason), nil
 		}
 
 		summaryUnderCheck.IsSound = true
 		return true, "Summary is sound: immutable parameters confirmed", nil
 	}
 
+	// Case 2: Intra-procedural reaching-definition analysis (ignoring function calls)
+	Sr := g.createReachingDefinitionSummary(function)
+	if g.isSummarySubset(summaryUnderCheck, Sr) {
+		summaryUnderCheck.IsSound = true
+		return true, "Summary is sound: subset of reaching-definition analysis", nil
+	}
+
 	// Clone the summary-under-check to avoid modifying the original
 	Su := summaryUnderCheck
-	// Create a most-general summary (Sg) where every callee function has maximum dataflows
-	Sg := g.createMostGeneralSummary(function)
+	// Sg is already created above for Case 0
 
 	// Create a most-preserved summary (Sp) with no dataflows between callees
 	Sp := g.createMostPreservedSummary(function)
@@ -1001,6 +1013,27 @@ func (g *InterProceduralFlowGraph) createMostGeneralSummary(function *ssa.Functi
 	summary.SyncGlobals()
 
 	// Use the analyzed summary as our most-general summary
+	return summary
+}
+
+// createReachingDefinitionSummary creates a summary using lightweight intra-procedural reaching-definition analysis,
+// making direct use of SSA structure. This represents Sr (reaching-definition summary) in the summary soundness check.
+func (g *InterProceduralFlowGraph) createReachingDefinitionSummary(function *ssa.Function) *SummaryGraph {
+	// Create a fresh empty summary
+	id := GetUniqueFunctionID()
+	summary := NewSummaryGraph(g.AnalyzerState, function, id, IsNodeOfInterest, nil)
+
+	// Perform lightweight reaching definition analysis using SSA structure directly
+	reachingDefs := PerformLightweightReachingDefinition(g.AnalyzerState, function)
+
+	// Build summary based on reaching definition results
+	BuildSummaryFromReachingDefs(g.AnalyzerState, summary, reachingDefs)
+
+	// Mark the summary as constructed and sound
+	summary.Constructed = true
+	summary.IsSound = true
+	summary.SyncGlobals()
+
 	return summary
 }
 

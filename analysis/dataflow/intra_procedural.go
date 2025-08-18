@@ -188,6 +188,58 @@ func (g *SummaryGraph) BuildFullFlowGraph() {
 	}
 }
 
+// BuildIdentityGraph builds an identity flow graph where each parameter flows directly to the corresponding return value
+// but no parameter flows to other parameters. This is used for reaching-definition analysis where function calls
+// are treated as identity functions (ignoring their internal effects).
+func (g *SummaryGraph) BuildIdentityGraph() {
+	// Clear all existing edges first
+	g.BuildEmptyGraph()
+
+	// Collect all input nodes (parameters and free variables)
+	var inputNodes []GraphNode
+	for _, paramNode := range g.Params {
+		inputNodes = append(inputNodes, paramNode)
+	}
+	for _, freeVarNode := range g.FreeVars {
+		inputNodes = append(inputNodes, freeVarNode)
+	}
+
+	// Collect all output nodes (return values) - flatten into a single slice
+	var outputNodes []GraphNode
+	for _, retTuple := range g.Returns {
+		for _, retNode := range retTuple {
+			if retNode != nil {
+				outputNodes = append(outputNodes, retNode)
+			}
+		}
+	}
+
+	// Create edge info for identity flow
+	identityFlowEdgeInfo := EdgeInfo{
+		RelPath: map[string]map[string]bool{"": {"": true}},
+		Index:   0,
+		Cond:    nil, // No condition - unconditional flow
+	}
+
+	// Create identity flows: each input parameter flows directly to corresponding return values
+	// For simplicity, we'll make each input flow to all returns (simulating identity function behavior)
+	for _, srcNode := range inputNodes {
+		for _, dstNode := range outputNodes {
+			// Add outgoing edge from input to output
+			if srcNode.Out()[dstNode] == nil {
+				srcNode.Out()[dstNode] = make([]EdgeInfo, 0, 1)
+			}
+			srcNode.Out()[dstNode] = append(srcNode.Out()[dstNode], identityFlowEdgeInfo)
+
+			// Add incoming edge to output from input
+			dstNode.In()[srcNode] = identityFlowEdgeInfo
+		}
+	}
+
+	// Note: We do NOT create parameter-to-parameter flows in identity graph
+	// This represents the case where function calls don't cause parameters to interfere with each other
+}
+
 // analysisResult holds the result of the intra-procedural analysis when run in a goroutine
 type analysisResult struct {
 	duration time.Duration
@@ -768,6 +820,14 @@ type ImmutableAnalysisResult struct {
 	NoFlowParams []*ssa.Parameter // Parameters that should have no flows at all
 }
 
+// immutableAnalysisResult contains the results of analyzing which parameters are immutable
+type immutableAnalysisResult struct {
+	IsSatisfied  bool             // Whether the immutable condition is satisfied
+	NoLHSParams  []*ssa.Parameter // Parameters that should never appear on LHS
+	NoRHSParams  []*ssa.Parameter // Parameters that should never appear on RHS
+	NoFlowParams []*ssa.Parameter // Parameters that should have no flows at all
+}
+
 // IsSpecSatisfyImmutable checks if the summary satisfies the immutable specification
 // by comparing it against a full flow summary where every parameter can flow to every other parameter and return
 func IsSpecSatisfyImmutable(summaryUnderCheck *SummaryGraph) ImmutableAnalysisResult {
@@ -1162,6 +1222,256 @@ func categorizeImmutableFlows(summary *SummaryGraph, missingFlows map[string]boo
 	return true
 }
 
+// IsSpecSatisfyimmutable checks if the summary satisfies the immutable specification
+// by comparing it against a full flow summary where every parameter can flow to every other parameter and return
+// The immutable condition means: if the summaryUnderCheck compares to the full flow summary,
+// the missing dataflows are all like: some parameters never flow to other parameters, or it's never flowed to.
+// Only when ALL the missing dataflows are in this format, we could make the check true.
+func IsSpecSatisfyimmutable(summaryUnderCheck *SummaryGraph) immutableAnalysisResult {
+	result := immutableAnalysisResult{
+		IsSatisfied:  false,
+		NoLHSParams:  []*ssa.Parameter{},
+		NoRHSParams:  []*ssa.Parameter{},
+		NoFlowParams: []*ssa.Parameter{},
+	}
+
+	if summaryUnderCheck == nil || summaryUnderCheck.Parent == nil {
+		return result
+	}
+
+	// Create a full flow summary where every parameter can flow to every other parameter and return
+	fullFlowSummary := createFullFlowSummary(summaryUnderCheck)
+	if fullFlowSummary == nil {
+		return result
+	}
+
+	// Compare the summaries to find missing flows
+	missingFlows := findMissingFlows(summaryUnderCheck, fullFlowSummary)
+
+	// Categorize the missing flows to see if they fit the immutable pattern
+	if categorizeimmutableFlows(summaryUnderCheck, missingFlows, &result) {
+		result.IsSatisfied = true
+	}
+
+	return result
+}
+
+// CheckParametersimmutableInSSA verifies that the identified immutable parameters
+// don't actually appear in SSA instructions where they shouldn't
+func CheckParametersimmutableInSSA(result immutableAnalysisResult, function *ssa.Function) (bool, string) {
+	if !result.IsSatisfied {
+		return false, "immutable analysis not satisfied"
+	}
+
+	// Create sets for efficient lookup
+	noLHSSet := make(map[*ssa.Parameter]bool)
+	for _, param := range result.NoLHSParams {
+		noLHSSet[param] = true
+	}
+
+	noRHSSet := make(map[*ssa.Parameter]bool)
+	for _, param := range result.NoRHSParams {
+		noRHSSet[param] = true
+	}
+
+	noFlowSet := make(map[*ssa.Parameter]bool)
+	for _, param := range result.NoFlowParams {
+		noFlowSet[param] = true
+	}
+
+	// Iterate through all instructions in the function
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			// Check if parameters appear where they shouldn't
+
+			// Check LHS (assignment targets) - these are instructions that define values
+			if value, ok := instr.(ssa.Value); ok {
+				// If this instruction defines a value that's a parameter that should never be on LHS
+				if param, isParam := value.(*ssa.Parameter); isParam && noLHSSet[param] {
+					return false, fmt.Sprintf("no-LHS parameter %s appears on LHS but should not", param.Name())
+				}
+				if param, isParam := value.(*ssa.Parameter); isParam && noFlowSet[param] {
+					return false, fmt.Sprintf("no-flow parameter %s appears in instruction", param.Name())
+				}
+			}
+
+			// Check RHS (operands/sources)
+			var operands []*ssa.Value
+			operands = instr.Operands(operands)
+			for _, operand := range operands {
+				if operand != nil {
+					if param, isParam := (*operand).(*ssa.Parameter); isParam {
+						// NoFlowParams should never appear anywhere
+						if noFlowSet[param] {
+							return false, fmt.Sprintf("no-flow parameter %s appears as operand", param.Name())
+						}
+						// NoRHSParams should never appear on the right-hand side
+						if noRHSSet[param] {
+							return false, fmt.Sprintf("no-RHS parameter %s appears as operand", param.Name())
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return true, "all immutable parameters verified in SSA"
+}
+
+// categorizeimmutableFlows analyzes missing flows to see if they fit immutable patterns
+// The immutable pattern is stricter than immutable: parameters must either never flow out
+// OR never be flowed to, creating a clear separation of dataflow responsibilities
+func categorizeimmutableFlows(summary *SummaryGraph, missingFlows map[string]bool, result *immutableAnalysisResult) bool {
+	if len(missingFlows) == 0 {
+		return true // No missing flows means it's already complete
+	}
+
+	// Track which parameters appear as sources or targets in actual flows
+	paramsAsSource := make(map[*ssa.Parameter]bool)
+	paramsAsTarget := make(map[*ssa.Parameter]bool)
+	paramsUsedInSSA := make(map[*ssa.Parameter]bool)
+	allParams := make(map[*ssa.Parameter]bool)
+
+	// Initialize all parameters
+	for _, paramNode := range summary.Params {
+		param := paramNode.SsaNode()
+		allParams[param] = true
+	}
+
+	// Check SSA instructions to see which parameters are actually used
+	if summary.Parent != nil {
+		for _, block := range summary.Parent.Blocks {
+			for _, instr := range block.Instrs {
+				// Check operands (RHS usage)
+				var operands []*ssa.Value
+				operands = instr.Operands(operands)
+				for _, operand := range operands {
+					if operand != nil {
+						if param, isParam := (*operand).(*ssa.Parameter); isParam {
+							paramsUsedInSSA[param] = true
+						}
+					}
+				}
+
+				// Check if the instruction defines a parameter (unusual but possible)
+				if value, ok := instr.(ssa.Value); ok {
+					if param, isParam := value.(*ssa.Parameter); isParam {
+						paramsUsedInSSA[param] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Check actual flows in the summary to categorize parameter usage
+	actualFlows := extractParameterFlows(summary)
+
+	for flow := range actualFlows {
+		parts := parseFlowString(flow)
+		if len(parts) != 2 {
+			continue
+		}
+
+		sourceParam := findParameterByString(summary, parts[0])
+		targetParam := findParameterByString(summary, parts[1])
+
+		if sourceParam != nil {
+			paramsAsSource[sourceParam] = true
+		}
+		if targetParam != nil {
+			paramsAsTarget[targetParam] = true
+		}
+	}
+
+	// Categorize parameters based on their usage patterns for immutable analysis
+	// For immutable: parameters must be strictly categorized - no mixing of roles
+	neverSourceParams := make(map[*ssa.Parameter]bool) // NoLHSParams - never appear as sources (input-only)
+	neverTargetParams := make(map[*ssa.Parameter]bool) // NoRHSParams - never appear as targets (output-only)
+	neverUsedParams := make(map[*ssa.Parameter]bool)   // NoFlowParams - never appear in any flows
+
+	for param := range allParams {
+		isSource := paramsAsSource[param]
+		isTarget := paramsAsTarget[param]
+		usedInSSA := paramsUsedInSSA[param]
+
+		if !usedInSSA {
+			// Parameter is never used in SSA instructions at all
+			neverUsedParams[param] = true
+		} else if !isSource && !isTarget {
+			// Parameter is used in SSA but doesn't participate in dataflow at all
+			neverUsedParams[param] = true
+		} else if isTarget && !isSource {
+			// Parameter only appears as target in flows, never as source (input-only)
+			neverSourceParams[param] = true
+		} else if isSource && !isTarget {
+			// Parameter only appears as source in flows, never as target (output-only)
+			neverTargetParams[param] = true
+		} else if isSource && isTarget {
+			// Parameter appears as both source and target - this violates immutable pattern
+			// In immutable analysis, parameters should have strict roles
+			return false
+		}
+	}
+
+	// For immutable analysis: ALL missing flows must be explainable by strict parameter roles
+	for flow := range missingFlows {
+		parts := parseFlowString(flow)
+		if len(parts) != 2 {
+			return false // Invalid flow string
+		}
+
+		sourceParam := findParameterByString(summary, parts[0])
+		targetParam := findParameterByString(summary, parts[1])
+		isReturnFlow := strings.Contains(parts[1], "return")
+
+		// Check if this missing flow fits the immutable pattern
+		validimmutableFlow := false
+
+		// Case 1: Source parameter never flows anywhere (never-source/never-used)
+		if sourceParam != nil && (neverSourceParams[sourceParam] || neverUsedParams[sourceParam]) {
+			validimmutableFlow = true
+		}
+
+		// Case 2: Target parameter is never flowed to (never-target/never-used)
+		if targetParam != nil && (neverTargetParams[targetParam] || neverUsedParams[targetParam]) {
+			validimmutableFlow = true
+		}
+
+		// Case 3: Flow to return from parameters that are never sources or never used
+		if isReturnFlow && sourceParam != nil && (neverSourceParams[sourceParam] || neverUsedParams[sourceParam]) {
+			validimmutableFlow = true
+		}
+
+		// Case 4: Parameter-to-parameter flows where one is input-only and other is output-only
+		if sourceParam != nil && targetParam != nil {
+			sourceIsInputOnly := neverSourceParams[sourceParam] || neverUsedParams[sourceParam]
+			targetIsOutputOnly := neverTargetParams[targetParam] || neverUsedParams[targetParam]
+			if sourceIsInputOnly || targetIsOutputOnly {
+				validimmutableFlow = true
+			}
+		}
+
+		if !validimmutableFlow {
+			return false // This missing flow doesn't fit immutable patterns
+		}
+	}
+
+	// Fill in the result with categorized parameters
+	for param := range neverSourceParams {
+		result.NoLHSParams = append(result.NoLHSParams, param)
+	}
+
+	for param := range neverTargetParams {
+		result.NoRHSParams = append(result.NoRHSParams, param)
+	}
+
+	for param := range neverUsedParams {
+		result.NoFlowParams = append(result.NoFlowParams, param)
+	}
+
+	return true
+}
+
 // parseFlowString parses a flow string like "param1 -> param2" into [source, target]
 func parseFlowString(flow string) []string {
 	parts := strings.Split(flow, " -> ")
@@ -1223,4 +1533,330 @@ func ShouldBuildSummary(state *State, function *ssa.Function) bool {
 	}
 	// Check package summaries
 	return !(summaries.PkgHasSummaries(pkg) || state.HasExternalContractSummary(function))
+}
+
+// ============================================================================
+// Lightweight Reaching Definition Analysis
+// ============================================================================
+
+// PerformLightweightReachingDefinition performs lightweight reaching definition analysis
+// using SSA properties directly, without calling RunIntraProcedural
+func PerformLightweightReachingDefinition(state *State, function *ssa.Function) map[ssa.Value]map[*ssa.Parameter]bool {
+	// Map from SSA value to set of parameters that can reach it
+	reachingDefs := make(map[ssa.Value]map[*ssa.Parameter]bool)
+
+	// Initialize parameters - each parameter reaches itself
+	for _, param := range function.Params {
+		reachingDefs[param] = map[*ssa.Parameter]bool{param: true}
+	}
+
+	// Initialize free variables (for closures)
+	for _, fv := range function.FreeVars {
+		reachingDefs[fv] = make(map[*ssa.Parameter]bool)
+		// Free variables don't come from parameters, so they start empty
+	}
+
+	// Walk through all blocks in the function
+	for _, block := range function.Blocks {
+		AnalyzeBlockForReachingDefs(state, block, reachingDefs)
+	}
+
+	return reachingDefs
+}
+
+// AnalyzeBlockForReachingDefs analyzes a single basic block for reaching definitions
+func AnalyzeBlockForReachingDefs(state *State, block *ssa.BasicBlock, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	for _, instr := range block.Instrs {
+		AnalyzeInstructionForReachingDefs(state, instr, reachingDefs)
+	}
+}
+
+// AnalyzeInstructionForReachingDefs analyzes a single SSA instruction for reaching definitions
+func AnalyzeInstructionForReachingDefs(state *State, instr ssa.Instruction, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	switch inst := instr.(type) {
+	case *ssa.Phi:
+		// φ-node: merge reaching definitions from all edges
+		HandlePhiInstruction(state, inst, reachingDefs)
+
+	case *ssa.UnOp, *ssa.BinOp, *ssa.Convert, *ssa.ChangeType, *ssa.ChangeInterface:
+		// Unary/binary operations: reaching defs flow through operands
+		if val, ok := instr.(ssa.Value); ok {
+			HandleArithmeticInstruction(state, val, reachingDefs)
+		}
+
+	case *ssa.Extract, *ssa.Field, *ssa.FieldAddr, *ssa.Index, *ssa.IndexAddr, *ssa.Slice:
+		// Field/index access: reaching defs flow through the accessed value
+		if val, ok := instr.(ssa.Value); ok {
+			HandleAccessInstruction(state, val, reachingDefs)
+		}
+
+	case *ssa.MakeInterface, *ssa.MakeSlice, *ssa.MakeMap, *ssa.MakeChan:
+		// Make operations: reaching defs flow through operands
+		if val, ok := instr.(ssa.Value); ok {
+			HandleMakeInstruction(state, val, reachingDefs)
+		}
+
+	case ssa.CallInstruction:
+		// Function calls: ignore internal effects (lightweight analysis)
+		// Only consider direct parameter passthrough for simple cases
+		HandleCallInstruction(state, inst, reachingDefs)
+
+	case *ssa.Alloc:
+		// Allocation creates new value with no reaching parameters
+		reachingDefs[inst] = make(map[*ssa.Parameter]bool)
+
+	case *ssa.Store:
+		// Store instruction: doesn't create a value, just updates memory
+		// We ignore stores in this lightweight analysis
+
+	case *ssa.Return:
+		// Return instruction: we'll handle this when building the summary
+		// No new value created by return
+
+	default:
+		// For unknown instructions that create values, assume no parameters reach them
+		if val, ok := instr.(ssa.Value); ok {
+			if _, exists := reachingDefs[val]; !exists {
+				reachingDefs[val] = make(map[*ssa.Parameter]bool)
+			}
+		}
+	}
+}
+
+// HandlePhiInstruction handles φ-nodes by merging reaching definitions from all incoming edges
+func HandlePhiInstruction(state *State, phi *ssa.Phi, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	merged := make(map[*ssa.Parameter]bool)
+
+	// Merge reaching definitions from all edges
+	for _, edge := range phi.Edges {
+		if sourceDefs, exists := reachingDefs[edge]; exists {
+			for param := range sourceDefs {
+				merged[param] = true
+			}
+		}
+	}
+
+	reachingDefs[phi] = merged
+}
+
+// HandleArithmeticInstruction handles arithmetic operations by propagating reaching definitions from operands
+func HandleArithmeticInstruction(state *State, val ssa.Value, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	merged := make(map[*ssa.Parameter]bool)
+
+	// Get operands from the instruction
+	var operands []*ssa.Value
+	operands = val.(ssa.Instruction).Operands(operands)
+
+	// Merge reaching definitions from all operands
+	for _, operand := range operands {
+		if operand != nil {
+			if sourceDefs, exists := reachingDefs[*operand]; exists {
+				for param := range sourceDefs {
+					merged[param] = true
+				}
+			}
+		}
+	}
+
+	reachingDefs[val] = merged
+}
+
+// HandleAccessInstruction handles field/index access by propagating reaching definitions from accessed value
+func HandleAccessInstruction(state *State, val ssa.Value, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	merged := make(map[*ssa.Parameter]bool)
+
+	// Get operands from the instruction
+	var operands []*ssa.Value
+	operands = val.(ssa.Instruction).Operands(operands)
+
+	// Usually the first operand is the accessed value
+	if len(operands) > 0 && operands[0] != nil {
+		if sourceDefs, exists := reachingDefs[*operands[0]]; exists {
+			for param := range sourceDefs {
+				merged[param] = true
+			}
+		}
+	}
+
+	reachingDefs[val] = merged
+}
+
+// HandleMakeInstruction handles make operations by propagating reaching definitions from operands
+func HandleMakeInstruction(state *State, val ssa.Value, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	merged := make(map[*ssa.Parameter]bool)
+
+	// Get operands from the instruction
+	var operands []*ssa.Value
+	operands = val.(ssa.Instruction).Operands(operands)
+
+	// Merge reaching definitions from all operands
+	for _, operand := range operands {
+		if operand != nil {
+			if sourceDefs, exists := reachingDefs[*operand]; exists {
+				for param := range sourceDefs {
+					merged[param] = true
+				}
+			}
+		}
+	}
+
+	reachingDefs[val] = merged
+}
+
+// HandleCallInstruction handles function calls in a lightweight manner by ignoring internal call effects
+func HandleCallInstruction(state *State, call ssa.CallInstruction, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	// For lightweight analysis, we ignore the internal effects of function calls
+	// We could optionally handle simple cases like identity functions, but for now keep it minimal
+
+	// If the call produces a value, assume it has no reaching parameters (conservative)
+	if val, ok := call.(ssa.Value); ok {
+		reachingDefs[val] = make(map[*ssa.Parameter]bool)
+	}
+
+	// Note: In a more sophisticated version, we might:
+	// - Handle builtin functions specially (e.g., len, cap preserve their argument's reaching defs)
+	// - Handle known pure functions that just pass through their arguments
+	// But for lightweight analysis, we keep it simple
+}
+
+// BuildSummaryFromReachingDefs builds a summary graph from reaching definition analysis results
+func BuildSummaryFromReachingDefs(state *State, summary *SummaryGraph, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	function := summary.Parent
+
+	// Walk through all return instructions to see which parameters can reach returns
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if ret, ok := instr.(*ssa.Return); ok {
+				AddReturnFlowsFromReachingDefs(state, summary, ret, reachingDefs)
+			}
+		}
+	}
+}
+
+// AddReturnFlowsFromReachingDefs adds flows from parameters to returns based on reaching definition analysis
+func AddReturnFlowsFromReachingDefs(state *State, summary *SummaryGraph, ret *ssa.Return, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	// For each return value, see which parameters can reach it
+	for tupleIndex, returnVal := range ret.Results {
+		if returnVal != nil {
+			// Get the set of parameters that can reach this return value
+			if reachingParams, exists := reachingDefs[returnVal]; exists {
+				// Create return node if it doesn't exist
+				if summary.Returns[ret] == nil {
+					returnNodes := make([]*ReturnValNode, len(ret.Results))
+					summary.Returns[ret] = returnNodes
+				}
+
+				// Create return node for this tuple index if it doesn't exist
+				if summary.Returns[ret][tupleIndex] == nil {
+					returnNode := &ReturnValNode{
+						id:     summary.newNodeID(),
+						parent: summary,
+						index:  tupleIndex,
+						in:     make(map[GraphNode]EdgeInfo),
+						out:    make(map[GraphNode][]EdgeInfo),
+					}
+					summary.Returns[ret][tupleIndex] = returnNode
+				}
+
+				returnNode := summary.Returns[ret][tupleIndex]
+
+				// Add flows from each reaching parameter to this return
+				for param := range reachingParams {
+					AddParameterToReturnFlow(state, summary, param, returnNode)
+				}
+			}
+		}
+	}
+}
+
+// AddParameterToReturnFlow adds a flow edge from a parameter to a return node
+func AddParameterToReturnFlow(state *State, summary *SummaryGraph, param *ssa.Parameter, returnNode *ReturnValNode) {
+	// Create parameter node if it doesn't exist
+	if summary.Params[param] == nil {
+		paramNode := &ParamNode{
+			id:      summary.newNodeID(),
+			parent:  summary,
+			ssaNode: param,
+			out:     make(map[GraphNode][]EdgeInfo),
+			in:      make(map[GraphNode]EdgeInfo),
+			argPos:  -1, // We could compute this, but for lightweight analysis it's not critical
+		}
+		summary.Params[param] = paramNode
+	}
+
+	paramNode := summary.Params[param]
+
+	// Create edge info representing the flow
+	edgeInfo := EdgeInfo{
+		RelPath: map[string]map[string]bool{"": {"": true}}, // Direct flow
+		Index:   0,
+		Cond:    nil, // Unconditional flow
+	}
+
+	// Add outgoing edge from parameter to return
+	if paramNode.out[returnNode] == nil {
+		paramNode.out[returnNode] = []EdgeInfo{edgeInfo}
+	} else {
+		// Check if this edge already exists to avoid duplicates
+		edgeExists := false
+		for _, existingEdge := range paramNode.out[returnNode] {
+			if compareEdgeInfoForReachingDefs(existingEdge, edgeInfo) {
+				edgeExists = true
+				break
+			}
+		}
+		if !edgeExists {
+			paramNode.out[returnNode] = append(paramNode.out[returnNode], edgeInfo)
+		}
+	}
+
+	// Add incoming edge to return from parameter
+	returnNode.in[paramNode] = edgeInfo
+}
+
+// compareEdgeInfoForReachingDefs compares two EdgeInfo structures for reaching definition analysis
+func compareEdgeInfoForReachingDefs(ei1, ei2 EdgeInfo) bool {
+	// Check if indices match
+	if ei1.Index != ei2.Index {
+		return false
+	}
+
+	// Compare conditions (either both nil or both equal)
+	if (ei1.Cond == nil) != (ei2.Cond == nil) {
+		return false
+	}
+	if ei1.Cond != nil && ei2.Cond != nil {
+		if ei1.Cond.Satisfiable != ei2.Cond.Satisfiable {
+			return false
+		}
+		if len(ei1.Cond.Conditions) != len(ei2.Cond.Conditions) {
+			return false
+		}
+		// For simplicity, we're not comparing the actual condition contents
+	}
+
+	// Compare RelPath maps
+	if len(ei1.RelPath) != len(ei2.RelPath) {
+		return false
+	}
+
+	// Check if all paths in ei1 exist in ei2
+	for inPath1, outPaths1 := range ei1.RelPath {
+		outPaths2, exists := ei2.RelPath[inPath1]
+		if !exists {
+			return false
+		}
+
+		if len(outPaths1) != len(outPaths2) {
+			return false
+		}
+
+		for outPath1 := range outPaths1 {
+			if _, exists := outPaths2[outPath1]; !exists {
+				return false
+			}
+		}
+	}
+
+	return true
 }

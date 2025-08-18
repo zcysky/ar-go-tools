@@ -751,15 +751,371 @@ func TestImmutableAnalysisIntegration(t *testing.T) {
 						functionName, len(needsDeeperCheck))
 				}
 
-				// Verify the reason mentions immutable
-				if !strings.Contains(reason, "immutable") && !strings.Contains(reason, "parameters confirmed") {
-					t.Errorf("Soundness reason should mention immutable analysis: %s", reason)
+				// Verify the reason mentions immutable analysis or equivalent flow summary (Case 0)
+				if !strings.Contains(reason, "immutable") && !strings.Contains(reason, "parameters confirmed") &&
+					!strings.Contains(reason, "already equivalent to full flow summary") {
+					t.Errorf("Soundness reason should mention immutable analysis or equivalent flow: %s", reason)
 				}
 
 				t.Logf("Function %s soundness: %v, reason: %s", functionName, isSound, reason)
 			})
 		}
 	}
+}
+
+// TestSSAReachingDefinition tests the SSA-based reaching definition analysis
+func TestSSAReachingDefinition(t *testing.T) {
+	dir := filepath.Join("testdata", "reaching")
+	lp, err := analysistest.LoadTest(
+		testfsys, dir, []string{}, analysistest.LoadTestOptions{ApplyRewrite: true}).Value()
+	if err != nil {
+		t.Fatalf("failed to load test: %v", err)
+	}
+
+	state, err := result.Bind(ptr.NewState(lp), dataflow.NewState).Value()
+	if err != nil {
+		t.Fatalf("failed to build analyzer state: %v", err)
+	}
+
+	// Test each function's reaching definition analysis
+	for _, pkg := range lp.Program.AllPackages() {
+		for _, member := range pkg.Members {
+			if function, ok := member.(*ssa.Function); ok && function.Blocks != nil {
+				functionName := function.Name()
+
+				// Skip main and test helper functions
+				if functionName == "main" || functionName == "init" {
+					continue
+				}
+
+				t.Run(functionName, func(t *testing.T) {
+					// Run lightweight reaching definition analysis
+					reachingDefs := dataflow.PerformLightweightReachingDefinition(state, function)
+
+					// Verify basic properties
+					if reachingDefs == nil {
+						t.Fatalf("PerformLightweightReachingDefinition returned nil")
+					}
+
+					// Check that each parameter reaches itself
+					for _, param := range function.Params {
+						paramReachingDefs, exists := reachingDefs[param]
+						if !exists {
+							t.Errorf("Parameter %s should have reaching definitions entry", param.Name())
+							continue
+						}
+						if !paramReachingDefs[param] {
+							t.Errorf("Parameter %s should reach itself", param.Name())
+						}
+					}
+
+					// Test function-specific expectations
+					verifyFunctionExpectations(t, functionName, function, reachingDefs)
+
+					// Test integration: build summary from reaching definitions
+					testSummaryBuilding(t, functionName, state, function, reachingDefs)
+				})
+			}
+		}
+	}
+}
+
+// verifyFunctionExpectations verifies expected behavior for specific test functions
+func verifyFunctionExpectations(t *testing.T, functionName string, function *ssa.Function, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	switch functionName {
+	case "SingleParamReturn":
+		// Parameter should reach the return value directly
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"input"}, true)
+
+	case "MultiParamReturn":
+		// Each parameter should reach only its corresponding return value
+		verifyMultipleReturnFlow(t, function, reachingDefs, map[int]string{0: "a", 1: "b", 2: "c"})
+
+	case "UnusedParameter":
+		// Only 'used' parameter should reach return, 'unused' should not
+		verifyParameterUsage(t, function, reachingDefs, "used", true)
+		verifyParameterUsage(t, function, reachingDefs, "unused", false)
+
+	case "ParameterReused":
+		// Parameter should reach return through multiple intermediate values
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"param"}, true)
+
+	case "ArithmeticFlow":
+		// Both parameters should reach return through arithmetic operations
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"a", "b"}, true)
+
+	case "ConditionalFlow":
+		// 'data' parameter should reach return, 'flag' should not (used only in condition)
+		verifyParameterUsage(t, function, reachingDefs, "data", true)
+		verifyParameterUsage(t, function, reachingDefs, "flag", false)
+
+	case "PhiNodeFlow":
+		// Both 'a' and 'b' parameters should reach return through phi node
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"a", "b"}, true)
+		// 'cond' should not reach return (used only in condition)
+		verifyParameterUsage(t, function, reachingDefs, "cond", false)
+
+	case "CallWithoutEffect":
+		// Parameter should NOT reach return because fmt.Sprintf call breaks the chain (lightweight analysis)
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"param"}, false)
+		// Verify that call results have empty reaching definitions (lightweight analysis)
+		verifyCallResultsHaveNoReachingDefs(t, function, reachingDefs)
+
+	case "NoParameterFlow":
+		// No parameters should reach return (constant return value)
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"a", "b"}, false)
+
+	case "PartialParameterFlow":
+		// Only 'used1' and 'used2' should reach return, 'unused' should not
+		verifyParameterUsage(t, function, reachingDefs, "used1", true)
+		verifyParameterUsage(t, function, reachingDefs, "unused", false)
+		verifyParameterUsage(t, function, reachingDefs, "used2", true)
+
+	case "MultipleAssignments":
+		// Parameter should reach return through multiple assignments
+		verifyParameterToReturnFlow(t, function, reachingDefs, []string{"param"}, true)
+	}
+}
+
+// verifyParameterToReturnFlow checks if specified parameters reach return values
+func verifyParameterToReturnFlow(t *testing.T, function *ssa.Function, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool, paramNames []string, shouldReach bool) {
+	// Find parameters by name
+	paramMap := make(map[string]*ssa.Parameter)
+	for _, param := range function.Params {
+		paramMap[param.Name()] = param
+	}
+
+	// Check return instructions
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if ret, ok := instr.(*ssa.Return); ok {
+				for i, returnVal := range ret.Results {
+					if returnVal == nil {
+						continue
+					}
+
+					returnReachingDefs, exists := reachingDefs[returnVal]
+					if !exists {
+						if shouldReach {
+							t.Errorf("Return value %d should have reaching definitions", i)
+						}
+						continue
+					}
+
+					for _, paramName := range paramNames {
+						param, exists := paramMap[paramName]
+						if !exists {
+							t.Errorf("Parameter %s not found in function", paramName)
+							continue
+						}
+
+						paramReaches := returnReachingDefs[param]
+						if shouldReach && !paramReaches {
+							t.Errorf("Parameter %s should reach return value %d", paramName, i)
+						} else if !shouldReach && paramReaches {
+							t.Errorf("Parameter %s should NOT reach return value %d", paramName, i)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// verifyMultipleReturnFlow checks that each parameter reaches only its corresponding return value
+func verifyMultipleReturnFlow(t *testing.T, function *ssa.Function, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool, paramToReturnMap map[int]string) {
+	// Find parameters by name
+	paramMap := make(map[string]*ssa.Parameter)
+	for _, param := range function.Params {
+		paramMap[param.Name()] = param
+	}
+
+	// Check return instructions
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if ret, ok := instr.(*ssa.Return); ok {
+				for returnIndex, returnVal := range ret.Results {
+					if returnVal == nil {
+						continue
+					}
+
+					returnReachingDefs, exists := reachingDefs[returnVal]
+					if !exists {
+						continue
+					}
+
+					// Check which parameters reach this return value
+					for param := range returnReachingDefs {
+						paramName := param.Name()
+
+						// Check if this parameter is expected to reach this return
+						expectedReturnIndex, paramShouldReachReturn := -1, false
+						for retIdx, expectedParamName := range paramToReturnMap {
+							if expectedParamName == paramName {
+								expectedReturnIndex = retIdx
+								paramShouldReachReturn = (retIdx == returnIndex)
+								break
+							}
+						}
+
+						if paramShouldReachReturn && !returnReachingDefs[param] {
+							t.Errorf("Parameter %s should reach return value %d", paramName, returnIndex)
+						} else if !paramShouldReachReturn && returnReachingDefs[param] {
+							t.Errorf("Parameter %s should reach return value %d, not %d", paramName, expectedReturnIndex, returnIndex)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// verifyParameterUsage checks if a parameter is used anywhere in reaching definitions
+func verifyParameterUsage(t *testing.T, function *ssa.Function, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool, paramName string, shouldBeUsed bool) {
+	// Find parameter by name
+	var targetParam *ssa.Parameter
+	for _, param := range function.Params {
+		if param.Name() == paramName {
+			targetParam = param
+			break
+		}
+	}
+
+	if targetParam == nil {
+		t.Errorf("Parameter %s not found in function", paramName)
+		return
+	}
+
+	// Check if parameter appears in any reaching definition sets
+	paramUsed := false
+	for value, paramSet := range reachingDefs {
+		if value != targetParam && paramSet[targetParam] {
+			paramUsed = true
+			break
+		}
+	}
+
+	if shouldBeUsed && !paramUsed {
+		t.Errorf("Parameter %s should be used but was not found in reaching definitions", paramName)
+	} else if !shouldBeUsed && paramUsed {
+		t.Errorf("Parameter %s should NOT be used but was found in reaching definitions", paramName)
+	}
+}
+
+// verifyCallResultsHaveNoReachingDefs ensures call results have no reaching parameters (lightweight analysis)
+func verifyCallResultsHaveNoReachingDefs(t *testing.T, function *ssa.Function, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if call, ok := instr.(ssa.CallInstruction); ok {
+				if callValue, hasValue := call.(ssa.Value); hasValue {
+					callReachingDefs, exists := reachingDefs[callValue]
+					if exists && len(callReachingDefs) > 0 {
+						t.Errorf("Call result should have no reaching parameters in lightweight analysis, but got: %v", callReachingDefs)
+					}
+				}
+			}
+		}
+	}
+}
+
+// testSummaryBuilding tests building summaries from reaching definition results
+func testSummaryBuilding(t *testing.T, functionName string, state *dataflow.State, function *ssa.Function, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool) {
+	// Create a test summary
+	id := dataflow.GetUniqueFunctionID()
+	summary := dataflow.NewSummaryGraph(state, function, id, dataflow.IsNodeOfInterest, nil)
+
+	// Build summary from reaching definitions
+	dataflow.BuildSummaryFromReachingDefs(state, summary, reachingDefs)
+
+	// Verify summary structure
+	if summary == nil {
+		t.Fatal("BuildSummaryFromReachingDefs returned nil summary")
+	}
+
+	// Check that parameters were created correctly
+	for _, param := range function.Params {
+		if _, exists := summary.Params[param]; !exists {
+			t.Errorf("Parameter %s was not added to summary", param.Name())
+		}
+	}
+
+	// Check that return nodes were created for functions with returns
+	hasReturns := false
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if ret, ok := instr.(*ssa.Return); ok && len(ret.Results) > 0 {
+				hasReturns = true
+				if _, exists := summary.Returns[ret]; !exists {
+					t.Errorf("Return instruction was not added to summary")
+				}
+			}
+		}
+	}
+
+	// Verify parameter-to-return edges based on reaching definitions
+	if hasReturns {
+		verifyParameterReturnEdges(t, summary, reachingDefs, function)
+	}
+}
+
+// verifyParameterReturnEdges checks that summary edges match reaching definition results
+func verifyParameterReturnEdges(t *testing.T, summary *dataflow.SummaryGraph, reachingDefs map[ssa.Value]map[*ssa.Parameter]bool, function *ssa.Function) {
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if ret, ok := instr.(*ssa.Return); ok {
+				returnNodes, exists := summary.Returns[ret]
+				if !exists {
+					continue
+				}
+
+				for tupleIndex, returnVal := range ret.Results {
+					if returnVal == nil || tupleIndex >= len(returnNodes) || returnNodes[tupleIndex] == nil {
+						continue
+					}
+
+					returnNode := returnNodes[tupleIndex]
+					returnReachingDefs, exists := reachingDefs[returnVal]
+					if !exists {
+						continue
+					}
+
+					// Check that edges exist for parameters that reach this return
+					for param := range returnReachingDefs {
+						paramNode, paramExists := summary.Params[param]
+						if !paramExists {
+							continue
+						}
+
+						// Check if there's an edge from parameter to return
+						hasEdge := false
+						for dest := range paramNode.Out() {
+							if dest == returnNode {
+								hasEdge = true
+								break
+							}
+						}
+
+						if !hasEdge {
+							t.Errorf("Missing edge from parameter %s to return %d", param.Name(), tupleIndex)
+						}
+
+						// Check reverse edge
+						if _, hasIncomingEdge := returnNode.In()[paramNode]; !hasIncomingEdge {
+							t.Errorf("Missing incoming edge to return %d from parameter %s", tupleIndex, param.Name())
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestReachingDefinitionInstructionHandlers tests individual instruction handlers
+func TestReachingDefinitionInstructionHandlers(t *testing.T) {
+	// This test is more complex to set up as it requires creating SSA instructions
+	// For now, we test the handlers indirectly through the integration tests
+	// In a more comprehensive test suite, we could create synthetic SSA instructions
+	t.Skip("Instruction handler unit tests require complex SSA instruction creation")
 }
 
 // test some methods that are meant to be nil-safe
