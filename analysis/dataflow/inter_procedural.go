@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/awslabs/ar-go-tools/analysis/config"
@@ -32,6 +33,28 @@ import (
 // Visitor represents a visitor that runs an inter-procedural analysis from entrypoint.
 type Visitor interface {
 	Visit(s *State, entrypoint NodeWithTrace)
+}
+
+// NodePair represents a pair of graph nodes for Case 3 subspec generation
+type NodePair struct {
+	Source GraphNode
+	Target GraphNode
+}
+
+// CalleeSubspecOption represents a potential subspec for a callee function
+type CalleeSubspecOption struct {
+	Callee          *ssa.Function
+	SubspecType     string // "full", "empty", "identity"
+	ViolationsFixed []NodePair
+	FixCount        int
+}
+
+// SetCoverState tracks the state of the set-cover algorithm
+type SetCoverState struct {
+	Universe        []NodePair               // All missing edges (violations)
+	Uncovered       map[NodePair]bool        // Currently uncovered violations
+	CalleeOptions   []*CalleeSubspecOption   // Available subspec options for each callee
+	SelectedCallees map[*ssa.Function]string // Selected subspecs: callee -> subspec type
 }
 
 // InterProceduralFlowGraph represents an inter-procedural data flow graph.
@@ -814,16 +837,87 @@ func (g *InterProceduralFlowGraph) debugSummaryFlows(function *ssa.Function, Su,
 // 	}
 // }
 
-// CheckSummarySoundness checks if a summary is sound by comparing three types of summaries:
-// - Most-general (Sg): assumes every callee function has maximum possible dataflows.
-// - Most-preserved (Sp): assumes no dataflows between callees - only analyzing dataflow within the function body itself.
-// - Summary-under-check (Su): the provided summary we're evaluating.
-//
-// It returns true if the summary is sound, false otherwise. It also returns a string explaining the reason
-// for the decision, and a map of callee functions that need deeper analysis (if applicable).
+// CheckSummarySoundness checks if a summary is sound by comparing three types of summaries.
+// This is the public interface that maintains backward compatibility.
 func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 	function *ssa.Function,
 	summaryUnderCheck *SummaryGraph) (bool, string, map[*ssa.Function]*SummaryGraph) {
+
+	// Initialize recursion tracking
+	visited := make(map[*ssa.Function]bool)
+	cache := make(map[*ssa.Function]bool)
+
+	return g.checkSummarySoundnessRecursive(function, summaryUnderCheck, 0, visited, cache)
+}
+
+// checkSummarySoundnessRecursive is the internal recursive implementation that checks soundness
+// with cycle detection, depth limiting, and caching.
+//
+// Parameters:
+// - function: The function whose summary is being checked
+// - summaryUnderCheck: The summary to validate
+// - recursionDepth: Current recursion depth (0 for root call)
+// - visited: Set of functions currently being analyzed (cycle detection)
+// - cache: Cache of previously computed soundness results
+//
+// Returns:
+// - bool: true if sound, false if unsound
+// - string: reason for the decision
+// - map[*ssa.Function]*SummaryGraph: subspecs that need deeper analysis
+func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
+	function *ssa.Function,
+	summaryUnderCheck *SummaryGraph,
+	recursionDepth int,
+	visited map[*ssa.Function]bool,
+	cache map[*ssa.Function]bool) (bool, string, map[*ssa.Function]*SummaryGraph) {
+
+	const maxRecursionDepth = 10
+
+	// Debug logging for recursion
+	if g.AnalyzerState.Logger.LogsDebug() {
+		indent := strings.Repeat("  ", recursionDepth)
+		g.AnalyzerState.Logger.Debugf("%sRecursive soundness check: %s (depth %d)",
+			indent, function.Name(), recursionDepth)
+	}
+
+	// Check cache first
+	if result, cached := cache[function]; cached {
+		reason := "cached result"
+		if result {
+			reason = "Summary is sound: cached positive result"
+		} else {
+			reason = "Summary is unsound: cached negative result"
+		}
+		return result, reason, nil
+	}
+
+	// Check for cycles
+	if visited[function] {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			indent := strings.Repeat("  ", recursionDepth)
+			g.AnalyzerState.Logger.Debugf("%sCycle detected for %s, assuming sound", indent, function.Name())
+		}
+		return true, "Summary is sound: cycle detected, assumed sound", nil
+	}
+
+	// Check recursion depth limit
+	if recursionDepth >= maxRecursionDepth {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			indent := strings.Repeat("  ", recursionDepth)
+			g.AnalyzerState.Logger.Debugf("%sMax depth reached for %s, using most-general assumption",
+				indent, function.Name())
+		}
+		// Use most-general summary assumption beyond max depth
+		summaryUnderCheck.IsSound = true
+		cache[function] = true
+		return true, "Summary is sound: max recursion depth reached, assumed most-general", nil
+	}
+
+	// Mark as being visited
+	visited[function] = true
+	defer func() {
+		delete(visited, function)
+	}()
 
 	// Case 0: Easiest case - if Su == Sg, trivially sound
 	Sg := createFullFlowSummary(summaryUnderCheck)
@@ -850,60 +944,107 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 		return true, "Summary is sound: subset of reaching-definition analysis", nil
 	}
 
-	// Case 3: Intra-procedural analysis by generating subspec
+	// Case 3: Inter-procedural analysis by generating subspec
 
-	// Clone the summary-under-check to avoid modifying the original
-	Su := summaryUnderCheck
-	// Sg is already created above for Case 0
-
-	// Create a most-preserved summary (Sp) with no dataflows between callees
-	Sp := g.createMostPreservedSummary(function)
-
-	// Debug: Output detailed flow information if debug logging is enabled
-	if g.AnalyzerState.Logger.LogsDebug() {
-		g.debugSummaryFlows(function, Su, Sg, Sp)
+	// Step 1: Create maximal summary assuming all callees have full graphs
+	maximalSummary := g.createMostGeneralSummary(function)
+	if maximalSummary == nil {
+		return false, "Failed to create maximal summary for Case 3", nil
 	}
 
-	// Compare summaries to determine the case
-	spEqualsSg := g.compareSummaries(Sp, Sg)
-	spSubsetOfSu := g.isSummarySubset(Sp, Su)
-	suSubsetOfSg := g.isSummarySubset(Su, Sg)
-	suEqualsSg := g.compareSummaries(Su, Sg)
-	spEqualsSu := g.compareSummaries(Sp, Su)
+	// Step 2: Extract flows using existing function (handles transitive closure)
+	actualFlows := g.extractParamFlows(summaryUnderCheck)
+	maximalFlows := g.extractParamFlows(maximalSummary)
 
-	// Initialize map for callees that need deeper analysis
-	calleesDiveDeeperMap := make(map[*ssa.Function]*SummaryGraph)
+	// Debug logging
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("Case 3: Actual flows count: %d", len(actualFlows))
+		g.AnalyzerState.Logger.Debugf("Case 3: Maximal flows count: %d", len(maximalFlows))
+	}
 
-	if spEqualsSg {
-		// Case 1: Sp = Sg
-		// In this case they should be just the targeted dataflow facts
-		// We don't need to recursively go down for any callee
-		Su.IsSound = true
-		return true, "Summary is sound: Sp = Sg, these are the targeted dataflow facts", nil
-	} else if spSubsetOfSu && suSubsetOfSg && !suEqualsSg {
-		// Case 2: Sp ⊆ Su ⊂ Sg
-		// We need to check evidence by diving deeper into callees
-		for _, calleeNodes := range Su.Callees {
-			for _, callNode := range calleeNodes {
-				if callNode.Callee() != nil {
-					// For each callee Gi, we need to check (Su∖Sp)∩Gi
-					// Add this callee to the map of functions to analyze deeper
-					calleesDiveDeeperMap[callNode.Callee()] = g.createIntersectionSummary(Su, Sp, callNode.Callee())
-				}
+	// Step 3: Find missing edges (target set)
+	targetSet := g.findMissingEdgesForCase3(actualFlows, maximalFlows, summaryUnderCheck, maximalSummary)
+
+	if len(targetSet) == 0 {
+		summaryUnderCheck.IsSound = true
+		return true, "Summary is sound: no missing edges in Case 3", nil
+	}
+
+	// Debug logging for target set
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("Case 3: Found %d missing edges in target set", len(targetSet))
+		for i, pair := range targetSet {
+			if i < 5 { // Log first 5 edges to avoid spam
+				g.AnalyzerState.Logger.Debugf("  Missing edge %d: %s -> %s", i, pair.Source.String(), pair.Target.String())
 			}
 		}
-		Su.IsSound = true
-		return true, "Summary is sound but needs evidence check: Sp ⊆ Su ⊂ Sg", calleesDiveDeeperMap
-	} else if !spEqualsSu && suEqualsSg {
-		// Case 3: Sp ⊂ Su = Sg
-		// Just take Su, no need to check callees
-		Su.IsSound = true
-		return true, "Summary is sound: Sp ⊂ Su = Sg, taking Su", nil
-	} else {
-		// Case 4: Otherwise, it's unsound
-		Su.IsSound = false
-		return false, "Summary is unsound: need to iterate again or perform non-LLM analysis", nil
+		if len(targetSet) > 5 {
+			g.AnalyzerState.Logger.Debugf("  ... and %d more missing edges", len(targetSet)-5)
+		}
 	}
+
+	// Step 4: Implement set-cover algorithm for subspec generation
+
+	// Step 4a: Identify potential subspec options for each callee
+	potentialOptions := g.identifyPotentialCalleeSubspecs(summaryUnderCheck, targetSet)
+
+	if len(potentialOptions) == 0 {
+		// No callees can help resolve the violations
+		summaryUnderCheck.IsSound = false
+		return false, fmt.Sprintf("Summary is unsound: %d missing edges cannot be resolved by any callee subspec",
+			len(targetSet)), nil
+	}
+
+	// Debug logging for potential options
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("Case 3: Found %d potential subspec options", len(potentialOptions))
+		for i, option := range potentialOptions {
+			if i < 10 { // Log first 10 options to avoid spam
+				g.AnalyzerState.Logger.Debugf("  Option %d: %s (%s) fixes %d violations",
+					i, option.Callee.Name(), option.SubspecType, option.FixCount)
+			}
+		}
+		if len(potentialOptions) > 10 {
+			g.AnalyzerState.Logger.Debugf("  ... and %d more options", len(potentialOptions)-10)
+		}
+	}
+
+	// Step 4b: Run greedy set-cover algorithm
+	setCoverResult := g.greedySetCoverAlgorithm(potentialOptions, targetSet)
+
+	// Step 4c: Check if set-cover was successful
+	if len(setCoverResult.Uncovered) > 0 {
+		// Some violations could not be covered
+		summaryUnderCheck.IsSound = false
+		return false, fmt.Sprintf("Summary is unsound: %d violations remain uncovered after set-cover",
+			len(setCoverResult.Uncovered)), nil
+	}
+
+	// Step 4d: Generate final subspecs for selected callees with recursive checking
+	calleesDiveDeeperMap, err := g.generateSelectedSubspecsWithRecursiveCheck(
+		summaryUnderCheck, setCoverResult, recursionDepth, visited, cache)
+
+	if err != nil {
+		// Recursive checking failed - propagate failure up
+		summaryUnderCheck.IsSound = false
+		cache[function] = false
+		return false, fmt.Sprintf("Summary is unsound: recursive subspec checking failed: %v", err), nil
+	}
+
+	// Debug final results
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("Case 3: Set-cover completed successfully with recursive validation")
+		g.AnalyzerState.Logger.Debugf("  Selected %d callees for subspec generation", len(calleesDiveDeeperMap))
+		for callee, subspecType := range setCoverResult.SelectedCallees {
+			g.AnalyzerState.Logger.Debugf("  - %s: %s subspec (recursively validated)", callee.Name(), subspecType)
+		}
+	}
+
+	// Cache the successful result
+	summaryUnderCheck.IsSound = true
+	cache[function] = true
+	return true, fmt.Sprintf("Summary is sound with recursive subspec validation: covered %d violations using %d callees",
+		len(targetSet), len(calleesDiveDeeperMap)), calleesDiveDeeperMap
 }
 
 // createMostGeneralSummary creates a summary where every callee function has maximum possible dataflows.
@@ -1127,7 +1268,6 @@ func (g *InterProceduralFlowGraph) extractParamFlows(summary *SummaryGraph) map[
 	for _, paramNode := range summary.Params {
 		visited := make(map[GraphNode]bool)
 		reachableTargets := g.findReachableTargets(paramNode, targetNodes, visited)
-
 		// Record flows to reachable target nodes (excluding self-loops)
 		for _, target := range reachableTargets {
 			if target != paramNode { // Skip self-loops
@@ -1155,7 +1295,10 @@ func (g *InterProceduralFlowGraph) findReachableTargets(startNode GraphNode, tar
 	}
 
 	// Explore all outgoing edges
+	edgeCount := 0
 	for destNode := range startNode.Out() {
+		edgeCount++
+
 		// Skip already visited nodes to prevent cycles
 		if visited[destNode] {
 			continue
@@ -1744,6 +1887,375 @@ func (g *InterProceduralFlowGraph) createIntersectionSummary(Su, Sp *SummaryGrap
 	})
 
 	return result
+}
+
+// parseFlowStringToNodes parses a flow string like "param1 -> param2" and returns the corresponding GraphNodes
+func (g *InterProceduralFlowGraph) parseFlowStringToNodes(flowString string, summary *SummaryGraph) (GraphNode, GraphNode, bool) {
+	parts := strings.Split(flowString, " -> ")
+	if len(parts) != 2 {
+		return nil, nil, false
+	}
+
+	sourceStr := strings.TrimSpace(parts[0])
+	targetStr := strings.TrimSpace(parts[1])
+
+	var sourceNode, targetNode GraphNode
+
+	// Find source node
+	summary.ForAllNodes(func(node GraphNode) {
+		if sourceNode == nil && node.String() == sourceStr {
+			sourceNode = node
+		}
+		if targetNode == nil && node.String() == targetStr {
+			targetNode = node
+		}
+	})
+
+	if sourceNode == nil || targetNode == nil {
+		return nil, nil, false
+	}
+
+	return sourceNode, targetNode, true
+}
+
+// findMissingEdgesForCase3 identifies missing edges between actualSummary and maximalSummary for Case 3 analysis
+func (g *InterProceduralFlowGraph) findMissingEdgesForCase3(
+	actualFlows, maximalFlows map[string]bool,
+	actualSummary, maximalSummary *SummaryGraph) []NodePair {
+
+	var targetSet []NodePair
+
+	// Find flows that exist in maximal but not in actual
+	for maximalFlow := range maximalFlows {
+		if !actualFlows[maximalFlow] {
+			// This is a missing flow, convert to NodePair
+			sourceNode, targetNode, ok := g.parseFlowStringToNodes(maximalFlow, maximalSummary)
+			if ok {
+				targetSet = append(targetSet, NodePair{
+					Source: sourceNode,
+					Target: targetNode,
+				})
+			}
+		}
+	}
+
+	return targetSet
+}
+
+// identifyPotentialCalleeSubspecs creates potential subspec options for each callee function
+func (g *InterProceduralFlowGraph) identifyPotentialCalleeSubspecs(
+	summaryUnderCheck *SummaryGraph,
+	targetSet []NodePair) []*CalleeSubspecOption {
+
+	var options []*CalleeSubspecOption
+	calleesProcessed := make(map[*ssa.Function]bool)
+
+	// For each callee in the summary, try different subspec options
+	for _, calleeMap := range summaryUnderCheck.Callees {
+		for _, callNode := range calleeMap {
+			callee := callNode.Callee()
+			if callee == nil || calleesProcessed[callee] {
+				continue
+			}
+			calleesProcessed[callee] = true
+
+			// Try three subspec options: full, empty, identity
+			subspecOptions := []string{"full", "empty", "identity"}
+			for _, subspecType := range subspecOptions {
+				option := &CalleeSubspecOption{
+					Callee:          callee,
+					SubspecType:     subspecType,
+					ViolationsFixed: []NodePair{},
+					FixCount:        0,
+				}
+
+				// Simulate this subspec and see which violations it fixes
+				fixedViolations := g.simulateCalleeSubspec(summaryUnderCheck, callee, subspecType, targetSet)
+				option.ViolationsFixed = fixedViolations
+				option.FixCount = len(fixedViolations)
+
+				// Only add options that actually fix some violations
+				if option.FixCount > 0 {
+					options = append(options, option)
+				}
+			}
+		}
+	}
+
+	return options
+}
+
+// simulateCalleeSubspec simulates applying a subspec to a callee and returns which violations it fixes
+func (g *InterProceduralFlowGraph) simulateCalleeSubspec(
+	summaryUnderCheck *SummaryGraph,
+	callee *ssa.Function,
+	subspecType string,
+	targetSet []NodePair) []NodePair {
+
+	// Clone the summary to avoid modifying the original
+	testSummary := g.cloneSummary(summaryUnderCheck)
+
+	// Apply the subspec to the callee in the test summary
+	g.applySubspecToCallee(testSummary, callee, subspecType)
+
+	// Extract flows from the modified summary
+	testFlows := g.extractParamFlows(testSummary)
+
+	// Check which violations from targetSet are now satisfied
+	var fixedViolations []NodePair
+	for _, violation := range targetSet {
+		violationKey := fmt.Sprintf("%s -> %s", violation.Source.String(), violation.Target.String())
+		if testFlows[violationKey] {
+			fixedViolations = append(fixedViolations, violation)
+		}
+	}
+
+	return fixedViolations
+}
+
+// applySubspecToCallee applies a specific subspec type to a callee function in the summary
+func (g *InterProceduralFlowGraph) applySubspecToCallee(
+	summary *SummaryGraph,
+	callee *ssa.Function,
+	subspecType string) {
+
+	// Find all call nodes for this callee and modify their summaries
+	for _, calleeMap := range summary.Callees {
+		for _, callNode := range calleeMap {
+			if callNode.Callee() == callee {
+				// Create or modify the callee's summary based on subspec type
+				switch subspecType {
+				case "full":
+					g.applyFullSubspec(callNode)
+				case "empty":
+					g.applyEmptySubspec(callNode)
+				case "identity":
+					g.applyIdentitySubspec(callNode)
+				}
+			}
+		}
+	}
+}
+
+// applyFullSubspec applies a full connectivity subspec to a callee
+func (g *InterProceduralFlowGraph) applyFullSubspec(callNode *CallNode) {
+	if callNode.CalleeSummary == nil {
+		id := GetUniqueFunctionID()
+		callNode.CalleeSummary = NewSummaryGraph(g.AnalyzerState, callNode.Callee(), id, IsNodeOfInterest, nil)
+	}
+	callNode.CalleeSummary.BuildFullFlowGraph()
+}
+
+// applyEmptySubspec applies an empty connectivity subspec to a callee
+func (g *InterProceduralFlowGraph) applyEmptySubspec(callNode *CallNode) {
+	if callNode.CalleeSummary == nil {
+		id := GetUniqueFunctionID()
+		callNode.CalleeSummary = NewSummaryGraph(g.AnalyzerState, callNode.Callee(), id, IsNodeOfInterest, nil)
+	}
+	callNode.CalleeSummary.BuildEmptyGraph()
+}
+
+// applyIdentitySubspec applies an identity connectivity subspec to a callee
+func (g *InterProceduralFlowGraph) applyIdentitySubspec(callNode *CallNode) {
+	if callNode.CalleeSummary == nil {
+		id := GetUniqueFunctionID()
+		callNode.CalleeSummary = NewSummaryGraph(g.AnalyzerState, callNode.Callee(), id, IsNodeOfInterest, nil)
+	}
+	callNode.CalleeSummary.BuildIdentityGraph()
+}
+
+// greedySetCoverAlgorithm performs greedy set-cover to select the best combination of subspecs
+func (g *InterProceduralFlowGraph) greedySetCoverAlgorithm(
+	options []*CalleeSubspecOption,
+	targetSet []NodePair) *SetCoverState {
+
+	// Initialize state
+	state := &SetCoverState{
+		Universe:        targetSet,
+		Uncovered:       make(map[NodePair]bool),
+		CalleeOptions:   options,
+		SelectedCallees: make(map[*ssa.Function]string),
+	}
+
+	// Initialize uncovered set
+	for _, violation := range targetSet {
+		state.Uncovered[violation] = true
+	}
+
+	// Debug logging
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("Set-cover: Starting with %d violations, %d options",
+			len(targetSet), len(options))
+	}
+
+	iteration := 0
+	// Greedy loop: keep selecting options until all violations are covered
+	for len(state.Uncovered) > 0 {
+		iteration++
+
+		// Find the option that covers the most uncovered violations
+		bestOption := g.findBestOption(state)
+		if bestOption == nil {
+			// No option can cover any remaining violations
+			break
+		}
+
+		// Select this option
+		state.SelectedCallees[bestOption.Callee] = bestOption.SubspecType
+
+		// Remove the violations this option covers
+		coveredCount := 0
+		for _, violation := range bestOption.ViolationsFixed {
+			if state.Uncovered[violation] {
+				delete(state.Uncovered, violation)
+				coveredCount++
+			}
+		}
+
+		// Debug logging
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("Set-cover iteration %d: selected %s (%s), covered %d violations, %d remaining",
+				iteration, bestOption.Callee.Name(), bestOption.SubspecType,
+				coveredCount, len(state.Uncovered))
+		}
+
+		// Prevent infinite loops
+		if iteration > 100 {
+			g.AnalyzerState.Logger.Warnf("Set-cover algorithm terminated after 100 iterations")
+			break
+		}
+	}
+
+	return state
+}
+
+// findBestOption finds the option that covers the most uncovered violations
+func (g *InterProceduralFlowGraph) findBestOption(state *SetCoverState) *CalleeSubspecOption {
+	var bestOption *CalleeSubspecOption
+	maxCoveredCount := 0
+
+	for _, option := range state.CalleeOptions {
+		// Skip if we've already selected a subspec for this callee
+		if _, alreadySelected := state.SelectedCallees[option.Callee]; alreadySelected {
+			continue
+		}
+
+		// Count how many uncovered violations this option would fix
+		coveredCount := 0
+		for _, violation := range option.ViolationsFixed {
+			if state.Uncovered[violation] {
+				coveredCount++
+			}
+		}
+
+		// Select this option if it covers more violations
+		if coveredCount > maxCoveredCount {
+			maxCoveredCount = coveredCount
+			bestOption = option
+		}
+	}
+
+	return bestOption
+}
+
+// generateSelectedSubspecs creates the final subspecs based on set-cover results
+func (g *InterProceduralFlowGraph) generateSelectedSubspecs(
+	summaryUnderCheck *SummaryGraph,
+	setCoverResult *SetCoverState) map[*ssa.Function]*SummaryGraph {
+
+	result := make(map[*ssa.Function]*SummaryGraph)
+
+	// For each selected callee, create its subspec
+	for callee, subspecType := range setCoverResult.SelectedCallees {
+		// Create a fresh summary for the callee
+		id := GetUniqueFunctionID()
+		subspecSummary := NewSummaryGraph(g.AnalyzerState, callee, id, IsNodeOfInterest, nil)
+
+		// Apply the selected subspec type
+		switch subspecType {
+		case "full":
+			subspecSummary.BuildFullFlowGraph()
+		case "empty":
+			subspecSummary.BuildEmptyGraph()
+		case "identity":
+			subspecSummary.BuildIdentityGraph()
+		}
+
+		// Mark as constructed and sound
+		subspecSummary.Constructed = true
+		subspecSummary.IsSound = true
+
+		result[callee] = subspecSummary
+	}
+
+	return result
+}
+
+// generateSelectedSubspecsWithRecursiveCheck creates subspecs and recursively validates them
+func (g *InterProceduralFlowGraph) generateSelectedSubspecsWithRecursiveCheck(
+	summaryUnderCheck *SummaryGraph,
+	setCoverResult *SetCoverState,
+	recursionDepth int,
+	visited map[*ssa.Function]bool,
+	cache map[*ssa.Function]bool) (map[*ssa.Function]*SummaryGraph, error) {
+
+	result := make(map[*ssa.Function]*SummaryGraph)
+
+	// For each selected callee, create its subspec and recursively check it
+	for callee, subspecType := range setCoverResult.SelectedCallees {
+
+		// Debug logging for recursive subspecs generation
+		if g.AnalyzerState.Logger.LogsDebug() {
+			indent := strings.Repeat("  ", recursionDepth)
+			g.AnalyzerState.Logger.Debugf("%sGenerating %s subspec for %s",
+				indent, subspecType, callee.Name())
+		}
+
+		// Create a fresh summary for the callee
+		id := GetUniqueFunctionID()
+		subspecSummary := NewSummaryGraph(g.AnalyzerState, callee, id, IsNodeOfInterest, nil)
+
+		// Apply the selected subspec type
+		switch subspecType {
+		case "full":
+			subspecSummary.BuildFullFlowGraph()
+		case "empty":
+			subspecSummary.BuildEmptyGraph()
+		case "identity":
+			subspecSummary.BuildIdentityGraph()
+		}
+
+		// Mark as constructed
+		subspecSummary.Constructed = true
+
+		// Recursively check if this subspec is sound
+		isSound, reason, nestedSubspecs := g.checkSummarySoundnessRecursive(
+			callee, subspecSummary, recursionDepth+1, visited, cache)
+
+		if !isSound {
+			// Recursive checking failed - propagate the failure up
+			if g.AnalyzerState.Logger.LogsDebug() {
+				indent := strings.Repeat("  ", recursionDepth)
+				g.AnalyzerState.Logger.Debugf("%sRecursive check failed for %s: %s",
+					indent, callee.Name(), reason)
+			}
+			return nil, fmt.Errorf("subspec for %s is unsound: %s", callee.Name(), reason)
+		}
+
+		// Mark as sound and add to result
+		subspecSummary.IsSound = true
+		result[callee] = subspecSummary
+
+		// If the recursive check generated nested subspecs, we could handle them here
+		// For now, we just log their existence
+		if len(nestedSubspecs) > 0 && g.AnalyzerState.Logger.LogsDebug() {
+			indent := strings.Repeat("  ", recursionDepth)
+			g.AnalyzerState.Logger.Debugf("%sSubspec for %s generated %d nested subspecs",
+				indent, callee.Name(), len(nestedSubspecs))
+		}
+	}
+
+	return result, nil
 }
 
 // PerformDataflowAnalysis performs intra-procedural dataflow analysis on the given function,
