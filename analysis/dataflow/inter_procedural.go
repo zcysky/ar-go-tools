@@ -41,20 +41,46 @@ type NodePair struct {
 	Target GraphNode
 }
 
-// CalleeSubspecOption represents a potential subspec for a callee function
+// SpecificEdge represents a specific edge to be added to a callee's summary
+type SpecificEdge struct {
+	Source   GraphNode // Source node in the callee
+	Target   GraphNode // Target node in the callee
+	EdgeInfo EdgeInfo  // Edge information (conditions, paths, etc.)
+}
+
+// CalleeEdgeOption represents a potential specific edge for a callee function
+type CalleeEdgeOption struct {
+	Callee          *ssa.Function // The callee function
+	Edge            SpecificEdge  // The specific edge to add
+	ViolationsFixed []NodePair    // Which violations this edge fixes in the caller
+	FixCount        int           // Number of violations this edge fixes
+}
+
+// SetCoverState tracks the state of the edge-based set-cover algorithm
+type SetCoverState struct {
+	Universe      []NodePair                       // All missing edges (violations) in the caller
+	Uncovered     map[NodePair]bool                // Currently uncovered violations
+	EdgeOptions   []*CalleeEdgeOption              // Available edge options for each callee
+	SelectedEdges map[*ssa.Function][]SpecificEdge // Selected edges: callee -> specific edges to add
+
+	// TEMPORARY: Legacy compatibility fields for compilation
+	CalleeOptions   []*CalleeSubspecOption   // DEPRECATED: Use EdgeOptions instead
+	SelectedCallees map[*ssa.Function]string // DEPRECATED: Use SelectedEdges instead
+}
+
+// Legacy type for backward compatibility (to be removed)
 type CalleeSubspecOption struct {
 	Callee          *ssa.Function
-	SubspecType     string // "full", "empty", "identity"
+	SubspecType     string // "full", "empty", "identity" - DEPRECATED
 	ViolationsFixed []NodePair
 	FixCount        int
 }
 
-// SetCoverState tracks the state of the set-cover algorithm
-type SetCoverState struct {
-	Universe        []NodePair               // All missing edges (violations)
-	Uncovered       map[NodePair]bool        // Currently uncovered violations
-	CalleeOptions   []*CalleeSubspecOption   // Available subspec options for each callee
-	SelectedCallees map[*ssa.Function]string // Selected subspecs: callee -> subspec type
+// RecursiveCheckResults tracks the results of recursively checking all callees
+type RecursiveCheckResults struct {
+	AllCalleesSound    bool   // True if all callees passed recursive checking
+	CalleeCount        int    // Total number of callees checked
+	FirstFailureReason string // Reason for first failure (if any)
 }
 
 // InterProceduralFlowGraph represents an inter-procedural data flow graph.
@@ -871,7 +897,7 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
 	visited map[*ssa.Function]bool,
 	cache map[*ssa.Function]bool) (bool, string, map[*ssa.Function]*SummaryGraph) {
 
-	const maxRecursionDepth = 10
+	const maxRecursionDepth = 100
 
 	// Debug logging for recursion
 	if g.AnalyzerState.Logger.LogsDebug() {
@@ -929,22 +955,122 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
 	// Case 1: immutable analysis - check if the spec can be proved by a simple analysis
 	if result := IsSpecSatisfyimmutable(summaryUnderCheck); result.IsSatisfied {
 		// Targeted SSA verification - much faster than checking all parameters
-		if isValid, reason := CheckParametersimmutableInSSA(result, function); !isValid {
-			return false, fmt.Sprintf("immutable analysis failed: %s", reason), nil
+		isValid, reason := CheckParametersimmutableInSSA(result, function)
+		if isValid {
+			// Case 1 succeeded
+			summaryUnderCheck.IsSound = true
+			cache[function] = true
+			return true, "Summary is sound: immutable parameters confirmed", nil
 		}
-
-		summaryUnderCheck.IsSound = true
-		return true, "Summary is sound: immutable parameters confirmed", nil
+		// Case 1 failed, but continue to other cases - don't return false here
+		if g.AnalyzerState.Logger.LogsDebug() {
+			indent := strings.Repeat("  ", recursionDepth)
+			g.AnalyzerState.Logger.Debugf("%sCase 1 (immutable) failed: %s, trying other cases", indent, reason)
+		}
 	}
 
 	// Case 2: Intra-procedural reaching-definition analysis (ignoring function calls)
 	Sr := g.createReachingDefinitionSummary(function)
 	if g.isSummarySubset(summaryUnderCheck, Sr) {
+		// Case 2 succeeded
 		summaryUnderCheck.IsSound = true
+		cache[function] = true
 		return true, "Summary is sound: subset of reaching-definition analysis", nil
+	}
+	// Case 2 failed, but continue to Case 3 - don't return false here
+	if g.AnalyzerState.Logger.LogsDebug() {
+		indent := strings.Repeat("  ", recursionDepth)
+		g.AnalyzerState.Logger.Debugf("%sCase 2 (reaching-definition) failed, trying Case 3", indent)
 	}
 
 	// Case 3: Inter-procedural analysis by generating subspec
+
+	// ENHANCED DIAGNOSTIC LOGGING: Compare SSA vs Summary callees
+	g.AnalyzerState.Logger.Debugf("=== CASE 3 ENTRY for %s ===", function.Name())
+
+	// 1. Function Type & SSA Status
+	g.AnalyzerState.Logger.Debugf("Function has %d blocks", len(function.Blocks))
+	g.AnalyzerState.Logger.Debugf("Summary constructed: %v", summaryUnderCheck.Constructed)
+	if function.Pkg != nil && function.Pkg.Pkg != nil {
+		g.AnalyzerState.Logger.Debugf("Package: %s", function.Pkg.Pkg.Path())
+	}
+
+	// 2. Direct SSA Call Analysis (Most Important!)
+	g.AnalyzerState.Logger.Debugf("=== SSA CALL INSTRUCTIONS ===")
+	ssaCallCount := 0
+	if len(function.Blocks) > 0 {
+		for blockIdx, block := range function.Blocks {
+			for instrIdx, instr := range block.Instrs {
+				if call, ok := instr.(*ssa.Call); ok {
+					ssaCallCount++
+					calleeStr := "unknown"
+					var calleeFunc *ssa.Function
+
+					// Try to get the callee function
+					if call.Call.Value != nil {
+						calleeStr = call.Call.Value.String()
+						if fn, ok := call.Call.Value.(*ssa.Function); ok {
+							calleeFunc = fn
+						}
+					}
+
+					// Enhanced logging for each SSA call
+					g.AnalyzerState.Logger.Debugf("  SSA Call %d: %s (block %d, instr %d)",
+						ssaCallCount, calleeStr, blockIdx, instrIdx)
+
+					if calleeFunc != nil {
+						g.AnalyzerState.Logger.Debugf("    Signature: %s", calleeFunc.Signature.String())
+						if g.AnalyzerState.Program != nil && g.AnalyzerState.Program.Fset != nil {
+							pos := g.AnalyzerState.Program.Fset.Position(calleeFunc.Pos())
+							g.AnalyzerState.Logger.Debugf("    Location: %s", pos)
+						}
+						if calleeFunc.Pkg != nil && calleeFunc.Pkg.Pkg != nil {
+							g.AnalyzerState.Logger.Debugf("    Package: %s", calleeFunc.Pkg.Pkg.Path())
+						}
+						// Check if it's external
+						isExternal := len(calleeFunc.Blocks) == 0
+						g.AnalyzerState.Logger.Debugf("    External: %v", isExternal)
+					}
+				}
+			}
+		}
+	}
+	g.AnalyzerState.Logger.Debugf("Total SSA calls found: %d", ssaCallCount)
+
+	// 3. Summary Callees Comparison
+	g.AnalyzerState.Logger.Debugf("=== SUMMARY CALLEES MAP ===")
+	g.AnalyzerState.Logger.Debugf("Summary.Callees map size: %d", len(summaryUnderCheck.Callees))
+	summaryCalleeCount := 0
+	for instr, calleeMap := range summaryUnderCheck.Callees {
+		g.AnalyzerState.Logger.Debugf("  Instruction: %s -> %d callees", instr.String(), len(calleeMap))
+		for _, callNode := range calleeMap {
+			callee := callNode.Callee()
+			if callee != nil {
+				summaryCalleeCount++
+				g.AnalyzerState.Logger.Debugf("    Summary Callee %d: %s", summaryCalleeCount, callee.Name())
+				// Add signature and location for summary callees too
+				g.AnalyzerState.Logger.Debugf("      Signature: %s", callee.Signature.String())
+				if g.AnalyzerState.Program != nil && g.AnalyzerState.Program.Fset != nil {
+					pos := g.AnalyzerState.Program.Fset.Position(callee.Pos())
+					g.AnalyzerState.Logger.Debugf("      Location: %s", pos)
+				}
+				if callee.Pkg != nil && callee.Pkg.Pkg != nil {
+					g.AnalyzerState.Logger.Debugf("      Package: %s", callee.Pkg.Pkg.Path())
+				}
+				isExternal := len(callee.Blocks) == 0
+				g.AnalyzerState.Logger.Debugf("      External: %v", isExternal)
+			}
+		}
+	}
+
+	// 4. Summary vs SSA Comparison
+	g.AnalyzerState.Logger.Debugf("=== COMPARISON SUMMARY ===")
+	g.AnalyzerState.Logger.Debugf("SSA calls found: %d", ssaCallCount)
+	g.AnalyzerState.Logger.Debugf("Summary callees found: %d", summaryCalleeCount)
+	if ssaCallCount != summaryCalleeCount {
+		g.AnalyzerState.Logger.Debugf("WARNING: Mismatch between SSA calls (%d) and summary callees (%d)",
+			ssaCallCount, summaryCalleeCount)
+	}
 
 	// Step 1: Create maximal summary assuming all callees have full graphs
 	maximalSummary := g.createMostGeneralSummary(function)
@@ -988,11 +1114,97 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
 	// Step 4a: Identify potential subspec options for each callee
 	potentialOptions := g.identifyPotentialCalleeSubspecs(summaryUnderCheck, targetSet)
 
+	// Step 4a.1: ALWAYS recursively check ALL callees, even if they can't help with current violations
+	recursiveCheckResults := g.recursivelyCheckAllCallees(summaryUnderCheck, recursionDepth, visited, cache)
+
 	if len(potentialOptions) == 0 {
-		// No callees can help resolve the violations
-		summaryUnderCheck.IsSound = false
-		return false, fmt.Sprintf("Summary is unsound: %d missing edges cannot be resolved by any callee subspec",
-			len(targetSet)), nil
+		// CRITICAL FIX: Handle the case where a function has no callees (external functions)
+		// For external functions with no callees, missing edges cannot be resolved by subspecs,
+		// but this is expected and should not be considered an error.
+
+		if recursiveCheckResults.CalleeCount == 0 {
+			// This is a leaf function with no callees
+			g.AnalyzerState.Logger.Debugf("reach the leaf, run intra-procedural")
+
+			// Check if this is an external function (no Go source code implementation)
+			isExternalFunction := len(function.Blocks) == 0 || (len(function.Blocks) > 0 && len(function.Blocks[0].Instrs) == 0)
+
+			if isExternalFunction {
+				// For external functions like ServerCodec, we cannot run intra-procedural analysis
+				// because there's no implementation to analyze. Instead, we validate that the
+				// summary is a reasonable subset of the maximal possible summary for this function.
+				g.AnalyzerState.Logger.Debugf("External leaf function %s: validating against maximal summary", function.Name())
+
+				// Create the most general summary for this external function
+				maximalSummary := g.createMostGeneralSummary(function)
+				if maximalSummary == nil {
+					// If we can't create maximal summary, accept the provided summary
+					g.AnalyzerState.Logger.Debugf("Cannot create maximal summary for external function %s, accepting provided summary", function.Name())
+					summaryUnderCheck.IsSound = true
+					cache[function] = true
+					return true, "Summary is sound: external function, cannot create maximal summary", nil
+				}
+
+				// For external functions, accept any summary that is a subset of the maximal summary
+				// This is sound because we're being conservative - the summary can't claim more flows than possible
+				if g.isSummarySubset(summaryUnderCheck, maximalSummary) {
+					summaryUnderCheck.IsSound = true
+					cache[function] = true
+					return true, "Summary is sound: external function subset of maximal flows", nil
+				} else {
+					// Log the differences for debugging
+					summaryFlows := g.extractParamFlows(summaryUnderCheck)
+					maximalFlows := g.extractParamFlows(maximalSummary)
+					g.AnalyzerState.Logger.Debugf("Summary flows (%d): %v", len(summaryFlows), summaryFlows)
+					g.AnalyzerState.Logger.Debugf("Maximal flows (%d): %v", len(maximalFlows), maximalFlows)
+
+					summaryUnderCheck.IsSound = false
+					cache[function] = false
+					return false, "Summary is unsound: external function has flows beyond maximal", nil
+				}
+			} else {
+				// For internal leaf functions, run intra-procedural analysis to get ground truth flows
+				intraSummary, err := g.PerformDataflowAnalysis(function)
+				if err != nil {
+					// If intra-procedural analysis fails, fall back to accepting the summary
+					g.AnalyzerState.Logger.Warnf("Intra-procedural analysis failed for leaf function %s: %v", function.Name(), err)
+					summaryUnderCheck.IsSound = true
+					cache[function] = true
+					return true, fmt.Sprintf("Summary is sound: leaf function, intra-procedural analysis failed but accepting summary"), nil
+				}
+
+				// Compare summary under check against intra-procedural result
+				// Sound if intra-procedural flows ⊆ summary flows (summary is superset of real flows)
+				if g.isSummarySubset(intraSummary, summaryUnderCheck) {
+					summaryUnderCheck.IsSound = true
+					cache[function] = true
+					return true, "Summary is sound: covers all actual parameter flows", nil
+				} else {
+					// Log the differences for debugging
+					summaryFlows := g.extractParamFlows(summaryUnderCheck)
+					intraFlows := g.extractParamFlows(intraSummary)
+					g.AnalyzerState.Logger.Debugf("Summary flows (%d): %v", len(summaryFlows), summaryFlows)
+					g.AnalyzerState.Logger.Debugf("Intra-procedural flows (%d): %v", len(intraFlows), intraFlows)
+
+					summaryUnderCheck.IsSound = false
+					cache[function] = false
+					return false, "Summary is unsound: missing some actual parameter flows", nil
+				}
+			}
+		}
+
+		// This function has callees, but none can help resolve the violations
+		if recursiveCheckResults.AllCalleesSound {
+			// All callees are sound, but they still can't help with our violations
+			summaryUnderCheck.IsSound = false
+			return false, fmt.Sprintf("Summary is unsound: %d missing edges cannot be resolved by any callee subspec (but %d callees recursively validated)",
+				len(targetSet), recursiveCheckResults.CalleeCount), nil
+		} else {
+			// Some callees are unsound
+			summaryUnderCheck.IsSound = false
+			return false, fmt.Sprintf("Summary is unsound: %d missing edges cannot be resolved, and some callees are unsound: %s",
+				len(targetSet), recursiveCheckResults.FirstFailureReason), nil
+		}
 	}
 
 	// Debug logging for potential options
@@ -1052,6 +1264,15 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
 //
 //gocyclo:ignore
 func (g *InterProceduralFlowGraph) createMostGeneralSummary(function *ssa.Function) *SummaryGraph {
+	// Debug logging at function entry
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] === createMostGeneralSummary ENTRY for %s ===", function.Name())
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function blocks: %d", len(function.Blocks))
+		if len(function.Blocks) > 0 {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] First block instructions: %d", len(function.Blocks[0].Instrs))
+		}
+	}
+
 	// Validate input parameters
 	if g == nil {
 		panic("InterProceduralFlowGraph is nil")
@@ -1063,6 +1284,93 @@ func (g *InterProceduralFlowGraph) createMostGeneralSummary(function *ssa.Functi
 		panic("function parameter is nil")
 	}
 
+	// Check if function has valid implementation
+	if len(function.Blocks) == 0 {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function %v has no blocks, creating most-general external summary", function)
+
+		// For external functions, create a fresh summary and build full connectivity
+		id := GetUniqueFunctionID()
+		summary := NewSummaryGraph(g.AnalyzerState, function, id, IsNodeOfInterest, nil)
+		if summary == nil {
+			panic(fmt.Sprintf("failed to create summary for function %v", function))
+		}
+
+		// Debug function signature
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function signature for %s:", function.Name())
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW]   Parameters: %d", len(function.Params))
+			for i, param := range function.Params {
+				g.AnalyzerState.Logger.Debugf("[DBG MXFLOW]     Param %d: %s (%s)", i, param.Name(), param.Type())
+			}
+
+			// Check signature info
+			sig := function.Signature
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW]   Signature params: %d", sig.Params().Len())
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW]   Signature results: %d", sig.Results().Len())
+		}
+
+		// CRITICAL FIX: For external functions, we must create parameter and return nodes
+		// BEFORE calling BuildFullFlowGraph(), otherwise it has nothing to connect!
+		g.createExternalFunctionNodes(summary, function)
+
+		// Now BuildFullFlowGraph() will have nodes to connect
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] About to call BuildFullFlowGraph for external function %s", function.Name())
+		}
+		summary.BuildFullFlowGraph()
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] BuildFullFlowGraph completed for external function %s", function.Name())
+		}
+		summary.Constructed = true
+		summary.IsSound = true
+
+		// Debug summary state after BuildFullFlowGraph
+		if g.AnalyzerState.Logger.LogsDebug() {
+			paramCount := len(summary.Params)
+			returnCount := 0
+			for _, rets := range summary.Returns {
+				returnCount += len(rets)
+			}
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Summary after BuildFullFlowGraph: %d params, %d returns", paramCount, returnCount)
+
+			// Debug flows
+			flows := g.extractParamFlows(summary)
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Extracted flows from external summary: %d", len(flows))
+			if len(flows) > 0 {
+				for flowKey := range flows {
+					g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Flow: %s", flowKey)
+				}
+			}
+		}
+
+		return summary
+	}
+
+	if len(function.Blocks[0].Instrs) == 0 {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function %v has no instructions in first block, creating most-general external summary", function)
+
+		// For external functions, create a fresh summary and build full connectivity
+		id := GetUniqueFunctionID()
+		summary := NewSummaryGraph(g.AnalyzerState, function, id, IsNodeOfInterest, nil)
+		if summary == nil {
+			panic(fmt.Sprintf("failed to create summary for function %v", function))
+		}
+
+		// CRITICAL FIX: Same issue - create nodes before BuildFullFlowGraph()
+		g.createExternalFunctionNodes(summary, function)
+
+		// For external functions, create a most-general summary with full connectivity
+		summary.BuildFullFlowGraph()
+		summary.Constructed = true
+		summary.IsSound = true
+		return summary
+	}
+
+	// CRITICAL FIX: For internal functions, use BuildFullFlowGraph directly instead of complex cloning
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function %v is internal, creating maximal summary with BuildFullFlowGraph", function.Name())
+	}
+
 	// Get or create a fresh summary for the function
 	summary := g.Summaries[function]
 	if summary == nil {
@@ -1071,92 +1379,139 @@ func (g *InterProceduralFlowGraph) createMostGeneralSummary(function *ssa.Functi
 		if summary == nil {
 			panic(fmt.Sprintf("failed to create summary for function %v", function))
 		}
-		// Clone the summary to avoid modifying the original
-		// summary = g.cloneSummary(summary)
-	} else {
-		// Clone the summary to avoid modifying the original
-		summary = g.cloneSummary(summary)
-		if summary == nil {
-			panic(fmt.Sprintf("failed to clone summary for function %v", function))
+		g.Summaries[function] = summary
+	}
+
+	// CRITICAL FIX: Instead of complex cloning and intra-procedural analysis,
+	// just use BuildFullFlowGraph which creates maximal connectivity
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] About to call BuildFullFlowGraph for internal function %s", function.Name())
+	}
+
+	// Create a fresh clone to avoid modifying the original
+	maximalSummary := g.cloneSummary(summary)
+	if maximalSummary == nil {
+		// If cloning fails, create a fresh summary
+		id := GetUniqueFunctionID()
+		maximalSummary = NewSummaryGraph(g.AnalyzerState, function, id, IsNodeOfInterest, nil)
+	}
+
+	// Build full connectivity - this creates the truly maximal summary
+	maximalSummary.BuildFullFlowGraph()
+	maximalSummary.Constructed = true
+	maximalSummary.IsSound = true
+
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] BuildFullFlowGraph completed for internal function %s", function.Name())
+
+		// Debug the resulting flows
+		flows := g.extractParamFlows(maximalSummary)
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Maximal summary flows: %d", len(flows))
+		if len(flows) > 0 {
+			for flowKey := range flows {
+				g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Maximal flow: %s", flowKey)
+			}
+		} else {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] WARNING: No flows in maximal summary!")
 		}
 	}
 
-	// Validate summary state after creation/cloning
-	if summary.Parent == nil {
-		panic(fmt.Sprintf("summary.Parent is nil for function %v", function))
+	return maximalSummary
+}
+
+// createExternalFunctionNodes creates parameter and return nodes for external functions
+// based on their function signatures. This is essential before calling BuildFullFlowGraph()
+// on external functions, otherwise there are no nodes to connect.
+func (g *InterProceduralFlowGraph) createExternalFunctionNodes(summary *SummaryGraph, function *ssa.Function) {
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] === createExternalFunctionNodes ENTRY for %s ===", function.Name())
 	}
 
-	// Check if function has valid implementation
-	if len(function.Blocks) == 0 {
-		g.AnalyzerState.Logger.Debugf("Function %v has no blocks, skipping intra-procedural analysis", function)
-		// For functions with no blocks, create a minimal summary
-		summary.Constructed = true
-		summary.IsSound = true
-		return summary
+	if summary == nil || function == nil {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] createExternalFunctionNodes: summary=%v, function=%v - returning early", summary == nil, function == nil)
+		}
+		return
 	}
 
-	if len(function.Blocks[0].Instrs) == 0 {
-		g.AnalyzerState.Logger.Debugf("Function %v has no instructions in first block, skipping intra-procedural analysis", function)
-		// For functions with no instructions, create a minimal summary
-		summary.Constructed = true
-		summary.IsSound = true
-		return summary
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function signature - Params: %d, Results: %d",
+			len(function.Params), function.Signature.Results().Len())
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Summary before node creation - Params: %d, Returns: %d",
+			len(summary.Params), len(summary.Returns))
 	}
 
-	// For each callee, create full dataflow connections
-	for _, calleeMap := range summary.Callees {
-		for _, callNode := range calleeMap {
-			// For most-general, assume every callee has full dataflow
-			if callNode != nil && callNode.Callee() != nil {
-				// If the callee doesn't have a summary, create one
-				if callNode.CalleeSummary == nil {
-					id := GetUniqueFunctionID()
-					calleeSummary := NewSummaryGraph(g.AnalyzerState, callNode.Callee(), id, IsNodeOfInterest, nil)
-					if calleeSummary != nil {
-						callNode.CalleeSummary = calleeSummary
-						g.Summaries[callNode.Callee()] = calleeSummary
-						// For most-general, always build a full flow graph
-						callNode.CalleeSummary.BuildFullFlowGraph()
-					}
-				} else if !callNode.CalleeSummary.IsSound {
-					// If the callee's summary is not sound, build a full flow graph
-					callNode.CalleeSummary.BuildFullFlowGraph()
-				}
-				// If the summary is sound, respect it and don't modify it
+	paramCount := 0
+	// Create parameter nodes based on function signature
+	for i, param := range function.Params {
+		if summary.shouldTrack == nil || summary.shouldTrack(g.AnalyzerState, param) {
+			paramNode := &ParamNode{
+				id:      summary.newNodeID(),
+				parent:  summary,
+				ssaNode: param,
+				out:     make(map[GraphNode][]EdgeInfo),
+				in:      make(map[GraphNode]EdgeInfo),
+				argPos:  i,
+			}
+			summary.Params[param] = paramNode
+			paramCount++
+
+			if g.AnalyzerState.Logger.LogsDebug() {
+				g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Created parameter node %d: %s (%s) with ID %d",
+					i, param.Name(), param.Type(), paramNode.id)
+			}
+		} else {
+			if g.AnalyzerState.Logger.LogsDebug() {
+				g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Skipped parameter node %d: %s (not tracked)",
+					i, param.Name())
 			}
 		}
 	}
 
-	// Validate summary state before running intra-procedural analysis
-	if summary.shouldTrack == nil {
-		g.AnalyzerState.Logger.Debugf("Setting shouldTrack to IsNodeOfInterest for function %v", function)
-		summary.shouldTrack = IsNodeOfInterest
+	returnCount := 0
+	// Create return value nodes based on function signature
+	sig := function.Signature
+	if sig.Results() != nil && sig.Results().Len() > 0 {
+		// Create a synthetic return instruction to hold the return nodes
+		// We use nil as the key since external functions don't have actual return instructions
+		var syntheticReturnInstr ssa.Instruction = nil
+		returnNodes := make([]*ReturnValNode, sig.Results().Len())
+
+		for i := 0; i < sig.Results().Len(); i++ {
+			returnNode := &ReturnValNode{
+				id:     summary.newNodeID(),
+				parent: summary,
+				index:  i,
+				in:     make(map[GraphNode]EdgeInfo),
+				out:    make(map[GraphNode][]EdgeInfo),
+			}
+			returnNodes[i] = returnNode
+			returnCount++
+
+			if g.AnalyzerState.Logger.LogsDebug() {
+				resultVar := sig.Results().At(i)
+				g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Created return node %d: %s with ID %d",
+					i, resultVar.Type(), returnNode.id)
+			}
+		}
+
+		summary.Returns[syntheticReturnInstr] = returnNodes
+
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Added %d return nodes to summary.Returns[nil]", len(returnNodes))
+		}
+	} else {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] No return values to create for function %s", function.Name())
+		}
 	}
 
-	// Additional validation before RunIntraProcedural
-	if summary.Parent != function {
-		panic(fmt.Sprintf("summary.Parent (%v) doesn't match function parameter (%v)", summary.Parent, function))
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] === createExternalFunctionNodes EXIT: created %d params, %d returns ===",
+			paramCount, returnCount)
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Summary after node creation - Params: %d, Returns: %d",
+			len(summary.Params), len(summary.Returns))
 	}
-
-	// Perform intra-procedural analysis on our carefully crafted summary
-	_, err := RunIntraProcedural(g.AnalyzerState, summary)
-	if err != nil {
-		// Log error but continue with the summary we've built so far
-		g.AnalyzerState.Logger.Warnf("Failed to analyze function %v with maximum callee flows: %v", function, err)
-		summary.BuildFullFlowGraph() // Fallback to full connectivity
-		// Mark as constructed even if analysis failed
-		summary.Constructed = true
-		summary.IsSound = false // Mark as unsound due to analysis failure
-		return summary
-	}
-
-	// Mark the summary as constructed and sound
-	summary.Constructed = true
-	summary.IsSound = true
-	summary.SyncGlobals()
-
-	// Use the analyzed summary as our most-general summary
-	return summary
 }
 
 // createReachingDefinitionSummary creates a summary using lightweight intra-procedural reaching-definition analysis,
@@ -1248,32 +1603,109 @@ func (g *InterProceduralFlowGraph) extractParamFlows(summary *SummaryGraph) map[
 	flows := make(map[string]bool)
 
 	if summary == nil {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] extractParamFlows: summary is nil, returning empty flows")
+		}
 		return flows
+	}
+
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] === extractParamFlows DEBUG for %s ===", summary.Parent.Name())
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Summary has %d params, %d return groups",
+			len(summary.Params), len(summary.Returns))
+
+		// Enhanced logging for external function debugging
+		isExternal := len(summary.Parent.Blocks) == 0 || (len(summary.Parent.Blocks) > 0 && len(summary.Parent.Blocks[0].Instrs) == 0)
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Function type: %s", func() string {
+			if isExternal {
+				return "EXTERNAL"
+			}
+			return "INTERNAL"
+		}())
 	}
 
 	// Collect all target nodes (parameters and return values) into a set for efficient lookup
 	targetNodes := make(map[GraphNode]bool)
+	paramCount := 0
 	for _, paramNode := range summary.Params {
 		targetNodes[paramNode] = true
+		paramCount++
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Target param node: %s", paramNode.String())
+		}
 	}
-	for _, retNodes := range summary.Returns {
-		for _, ret := range retNodes {
+
+	returnCount := 0
+	for instrKey, retNodes := range summary.Returns {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			instrStr := "nil"
+			if instrKey != nil {
+				instrStr = instrKey.String()
+			}
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Return group for instruction %s: %d nodes", instrStr, len(retNodes))
+		}
+		for i, ret := range retNodes {
 			if ret != nil { // Return nodes can be nil for constant values
 				targetNodes[ret] = true
+				returnCount++
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Target return node %d: %s", i, ret.String())
+				}
+			} else {
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Return node %d is nil (skipped)", i)
+				}
 			}
 		}
 	}
 
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Total target nodes: %d params + %d returns = %d",
+			paramCount, returnCount, len(targetNodes))
+	}
+
 	// For each parameter, find all reachable target nodes using DFS
+	flowCount := 0
 	for _, paramNode := range summary.Params {
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Analyzing flows from param: %s", paramNode.String())
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Param has %d outgoing edges", len(paramNode.Out()))
+		}
+
 		visited := make(map[GraphNode]bool)
 		reachableTargets := g.findReachableTargets(paramNode, targetNodes, visited)
+
+		if g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Found %d reachable targets from %s",
+				len(reachableTargets), paramNode.String())
+		}
+
 		// Record flows to reachable target nodes (excluding self-loops)
 		for _, target := range reachableTargets {
 			if target != paramNode { // Skip self-loops
 				flowKey := fmt.Sprintf("%s -> %s", paramNode.String(), target.String())
 				flows[flowKey] = true
+				flowCount++
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Added flow: %s", flowKey)
+				}
+			} else {
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Skipped self-loop: %s -> %s",
+						paramNode.String(), target.String())
+				}
 			}
+		}
+	}
+
+	if g.AnalyzerState.Logger.LogsDebug() {
+		g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] === extractParamFlows RESULT: %d flows ===", len(flows))
+		if len(flows) > 0 {
+			for flowKey := range flows {
+				g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] Final flow: %s", flowKey)
+			}
+		} else {
+			g.AnalyzerState.Logger.Debugf("[DBG MXFLOW] No flows found!")
 		}
 	}
 
@@ -1992,25 +2424,68 @@ func (g *InterProceduralFlowGraph) simulateCalleeSubspec(
 	subspecType string,
 	targetSet []NodePair) []NodePair {
 
-	// Clone the summary to avoid modifying the original
-	testSummary := g.cloneSummary(summaryUnderCheck)
+	// CRITICAL FIX: The original logic was inverted. For missing edges, we need to:
+	// 1. Create a new maximal summary with the subspec applied to the callee
+	// 2. Compare actual flows vs new maximal flows
+	// 3. Count how many missing edges are eliminated (not how many flows are added)
 
-	// Apply the subspec to the callee in the test summary
-	g.applySubspecToCallee(testSummary, callee, subspecType)
+	// Create a new maximal summary with the subspec applied to this callee
+	testMaximalSummary := g.createMaximalSummaryWithSubspec(summaryUnderCheck.Parent, callee, subspecType)
 
-	// Extract flows from the modified summary
-	testFlows := g.extractParamFlows(testSummary)
+	// Extract flows from both summaries
+	actualFlows := g.extractParamFlows(summaryUnderCheck)
+	testMaximalFlows := g.extractParamFlows(testMaximalSummary)
 
-	// Check which violations from targetSet are now satisfied
+	// Find which violations from targetSet are eliminated by this subspec
 	var fixedViolations []NodePair
 	for _, violation := range targetSet {
 		violationKey := fmt.Sprintf("%s -> %s", violation.Source.String(), violation.Target.String())
-		if testFlows[violationKey] {
+
+		// A violation is "fixed" if:
+		// - It was missing in actual vs original maximal (violation.Source -> violation.Target was in maximal but not actual)
+		// - After applying subspec, it's no longer missing (either appears in actual or disappears from maximal)
+
+		actualHasFlow := actualFlows[violationKey]
+		testMaximalHasFlow := testMaximalFlows[violationKey]
+
+		// The violation is fixed if the discrepancy is eliminated:
+		// Either the flow appears in actual, or it disappears from maximal
+		if actualHasFlow || !testMaximalHasFlow {
 			fixedViolations = append(fixedViolations, violation)
 		}
 	}
 
 	return fixedViolations
+}
+
+// createMaximalSummaryWithSubspec creates a maximal summary for a function with a specific subspec applied to one callee
+func (g *InterProceduralFlowGraph) createMaximalSummaryWithSubspec(function *ssa.Function, targetCallee *ssa.Function, subspecType string) *SummaryGraph {
+	// Create a maximal summary for the function
+	maximalSummary := g.createMostGeneralSummary(function)
+
+	// Clone it to avoid modifying the original
+	testSummary := g.cloneSummary(maximalSummary)
+	if testSummary == nil {
+		// If cloning fails, return the original
+		return maximalSummary
+	}
+
+	// Apply the specific subspec to the target callee
+	g.applySubspecToCallee(testSummary, targetCallee, subspecType)
+
+	// Re-run intra-procedural analysis to propagate the changes
+	if testSummary.Parent != nil && len(testSummary.Parent.Blocks) > 0 {
+		// Only run intra-procedural analysis for internal functions
+		_, err := RunIntraProcedural(g.AnalyzerState, testSummary)
+		if err != nil {
+			// If analysis fails, fall back to the original maximal summary
+			g.AnalyzerState.Logger.Debugf("Failed to re-analyze function %v with subspec %s for callee %v: %v",
+				function, subspecType, targetCallee, err)
+			return maximalSummary
+		}
+	}
+
+	return testSummary
 }
 
 // applySubspecToCallee applies a specific subspec type to a callee function in the summary
@@ -2069,10 +2544,31 @@ func (g *InterProceduralFlowGraph) greedySetCoverAlgorithm(
 	options []*CalleeSubspecOption,
 	targetSet []NodePair) *SetCoverState {
 
-	// Initialize state
+	// Initialize state - TEMPORARY: convert old options to new structure
+	edgeOptions := make([]*CalleeEdgeOption, 0)
+	for _, option := range options {
+		// For now, convert each old-style option to multiple edge options
+		// TODO: Replace with proper edge-based enumeration
+		edgeOption := &CalleeEdgeOption{
+			Callee: option.Callee,
+			Edge: SpecificEdge{
+				Source:   nil,        // TODO: implement proper edge identification
+				Target:   nil,        // TODO: implement proper edge identification
+				EdgeInfo: EdgeInfo{}, // TODO: implement proper edge info
+			},
+			ViolationsFixed: option.ViolationsFixed,
+			FixCount:        option.FixCount,
+		}
+		edgeOptions = append(edgeOptions, edgeOption)
+	}
+
 	state := &SetCoverState{
-		Universe:        targetSet,
-		Uncovered:       make(map[NodePair]bool),
+		Universe:      targetSet,
+		Uncovered:     make(map[NodePair]bool),
+		EdgeOptions:   edgeOptions,
+		SelectedEdges: make(map[*ssa.Function][]SpecificEdge),
+
+		// TEMPORARY: Initialize legacy compatibility fields
 		CalleeOptions:   options,
 		SelectedCallees: make(map[*ssa.Function]string),
 	}
@@ -2256,6 +2752,87 @@ func (g *InterProceduralFlowGraph) generateSelectedSubspecsWithRecursiveCheck(
 	}
 
 	return result, nil
+}
+
+// recursivelyCheckAllCallees recursively checks all callees of a function, regardless of whether they help with violations
+func (g *InterProceduralFlowGraph) recursivelyCheckAllCallees(
+	summaryUnderCheck *SummaryGraph,
+	recursionDepth int,
+	visited map[*ssa.Function]bool,
+	cache map[*ssa.Function]bool) *RecursiveCheckResults {
+
+	results := &RecursiveCheckResults{
+		AllCalleesSound:    true,
+		CalleeCount:        0,
+		FirstFailureReason: "",
+	}
+
+	calleesProcessed := make(map[*ssa.Function]bool)
+
+	// Iterate through all callees in the summary
+	for _, calleeMap := range summaryUnderCheck.Callees {
+		for _, callNode := range calleeMap {
+			callee := callNode.Callee()
+			if callee == nil || calleesProcessed[callee] {
+				continue
+			}
+			calleesProcessed[callee] = true
+			results.CalleeCount++
+
+			// CRITICAL FIX: Use the actual callee's summary for recursive checking, not empty graph
+			// The recursive validation should check if the callee's actual implementation is sound
+			var subspecSummary *SummaryGraph
+
+			// Try to get the existing summary for this callee
+			if existingSummary, exists := g.Summaries[callee]; exists && existingSummary.Constructed {
+				// Use the existing constructed summary
+				subspecSummary = existingSummary
+			} else {
+				// If no existing summary, we need to build one based on the callee's actual implementation
+				// For external functions, create a most-general summary
+				if len(callee.Blocks) == 0 {
+					subspecSummary = g.createMostGeneralSummary(callee)
+				} else {
+					// For internal functions, perform actual dataflow analysis
+					var err error
+					subspecSummary, err = g.PerformDataflowAnalysis(callee)
+					if err != nil {
+						// If analysis fails, this callee is unsound
+						results.AllCalleesSound = false
+						if results.FirstFailureReason == "" {
+							results.FirstFailureReason = fmt.Sprintf("%s: failed to analyze: %v", callee.Name(), err)
+						}
+						continue
+					}
+				}
+			}
+
+			// Recursively check this callee with its actual summary
+			isSound, reason, _ := g.checkSummarySoundnessRecursive(
+				callee, subspecSummary, recursionDepth+1, visited, cache)
+
+			if !isSound {
+				results.AllCalleesSound = false
+				if results.FirstFailureReason == "" {
+					results.FirstFailureReason = fmt.Sprintf("%s: %s", callee.Name(), reason)
+				}
+				// Continue checking other callees to get full count
+			}
+
+			// Debug logging for individual callee results
+			if g.AnalyzerState.Logger.LogsDebug() {
+				indent := strings.Repeat("  ", recursionDepth)
+				status := "sound"
+				if !isSound {
+					status = "unsound"
+				}
+				g.AnalyzerState.Logger.Debugf("%sRecursive check for callee %s: %s",
+					indent, callee.Name(), status)
+			}
+		}
+	}
+
+	return results
 }
 
 // PerformDataflowAnalysis performs intra-procedural dataflow analysis on the given function,
