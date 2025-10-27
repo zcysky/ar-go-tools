@@ -815,3 +815,15 @@ func (c Config) GetSpecs() []TaggedSpec {
 	}
 	return specs
 }
+
+// IsTaintLikeTool returns true if the tool is a taint-like tool.
+func (t ToolName) IsTaintLikeTool() bool {
+	return t == TaintTool || t == BacktraceTool || t == CheckTool
+}
+
+// IsCompareLikeTool returns true if the tool is a compare-like tool.
+// Currently, this is only used by the tests, to decide which golden file to use.
+// (In the future, we may want to make this more flexible, and let the user specify which tool they are using)
+func (t ToolName) IsCompareLikeTool() bool {
+	return t == CompareTool || t == CheckTool
+}

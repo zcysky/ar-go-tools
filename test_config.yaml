@@ -1,2 +1,49 @@
+options:
+  log-level: 4
+  reports-dir: "./results"
+  report-paths: true
+  report-summaries: true
+
 dataflow-problems:
-  taint-tracking: []
+  summarize-on-demand: false
+  taint-tracking:
+    - tag: "user"
+      sources:
+        - package: "main"
+          method: "getUserInput"
+        - package: "main"
+          method: "readFile"
+      sinks:
+        - package: "main"
+          method: "executeQuery"
+        - package: "main"
+          method: "renderHTML"
+        - package: "main"
+          method: "executeCommand"
+      sanitizers:
+        - package: "main"
+          method: "sanitizeSQL"
+        - package: "main"
+          method: "sanitizeHTML"
+        - package: "main"
+          method: "sanitizeFilePath"
+    - tag: "file"
+      sources:
+        - package: "main"
+          method: "readFile"
+      sinks:
+        - package: "main"
+          method: "executeQuery"
+        - package: "main"
+          method: "renderHTML"
+        - package: "main"
+          method: "executeCommand"
+      sanitizers:
+        - package: "main"
+          method: "sanitizeSQL"
+        - package: "main"
+          method: "sanitizeHTML"
+        - package: "main"
+          method: "sanitizeFilePath"
+  user-specs:
+    - test_summary.yaml

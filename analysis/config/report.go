@@ -49,6 +49,15 @@ type ReportGroup struct {
 	Details  []string
 }
 
+// NumAlarms returns the total number of alarms in the report.
+func (r *ReportInfo) NumAlarms() int {
+	count := 0
+	for _, group := range r.Reports {
+		count += len(group.Details)
+	}
+	return count
+}
+
 // ReportEntry is one entry in the report, with high-level information about the severity and what tool
 // generated it. Contents of the report should be stored in a separate content file.
 type ReportEntry struct {

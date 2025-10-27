@@ -20,7 +20,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/awslabs/ar-go-tools/analysis/config"
 	"github.com/awslabs/ar-go-tools/analysis/lang"
@@ -172,7 +171,7 @@ func (g *InterProceduralFlowGraph) InsertSummaries(g2 InterProceduralFlowGraph) 
 // BuildGraph builds the cross function flow graph by connecting summaries together
 //
 //gocyclo:ignore
-func (g *InterProceduralFlowGraph) BuildGraph() {
+func (g *InterProceduralFlowGraph) BuildGraph() []*SummaryGraph {
 	c := g.AnalyzerState
 	logger := c.Logger
 
@@ -223,11 +222,13 @@ func (g *InterProceduralFlowGraph) BuildGraph() {
 	}
 
 	// After loading external summaries everywhere, check them one by one
+	var unsoundSummaries []*SummaryGraph
 	for fn, extSum := range externalSummariesToCheck {
 		isSound, reason, needsDeeperCheck := g.CheckSummarySoundness(fn, extSum)
 		if !isSound {
 			logger.Warnf("External summary for %s is not sound: %s",
 				formatutil.SanitizeRepr(fn), reason)
+			unsoundSummaries = append(unsoundSummaries, extSum)
 		} else {
 			logger.Debugf("External summary for %s is sound: %s",
 				formatutil.SanitizeRepr(fn), reason)
@@ -292,6 +293,7 @@ func (g *InterProceduralFlowGraph) BuildGraph() {
 	}
 	// Change the built flag to true
 	g.built = true
+	return unsoundSummaries
 }
 
 // Sync synchronizes inter-procedural information in the graph. This is useful if updating a summary generates nodes
@@ -411,45 +413,11 @@ func (g *InterProceduralFlowGraph) RunVisitorOnEntryPoints(visitor Visitor, spec
 				len(entryPoints)-i)
 			return
 		}
-
-		// Run visitor with timeout protection
-		g.runVisitorWithTimeout(visitor, entry, i+1, len(entryPoints))
+		visitor.Visit(g.AnalyzerState, entry)
 		i++
 	}
 }
 
-// runVisitorWithTimeout runs the visitor on an entry point with timeout protection
-func (g *InterProceduralFlowGraph) runVisitorWithTimeout(visitor Visitor, entry NodeWithTrace, current, total int) {
-	timeout := 10 * time.Second // Use 10 seconds for inter-procedural entry points
-	done := make(chan bool, 1)
-	cancelled := make(chan bool, 1)
-
-	// Run visitor in separate goroutine
-	go func() {
-		visitor.Visit(g.AnalyzerState, entry)
-		done <- true
-	}()
-
-	// Start timeout monitoring goroutine
-	go func() {
-		time.Sleep(timeout)
-		cancelled <- true
-	}()
-
-	// Race between completion and cancellation
-	select {
-	case <-done:
-		// Visitor completed within timeout
-		return
-	case <-cancelled:
-		// Timeout occurred - log and continue
-		g.AnalyzerState.Logger.Warnf("Entry point %d/%d (%s) cancelled due to time out",
-			current, total, entry.Node.String())
-		return
-	}
-}
-
-// TODO this will likely get refactored in the future anyways
 //
 //gocyclo:ignore
 func scanEntryPoints(
@@ -1010,11 +978,41 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 	visited := make(map[*ssa.Function]bool)
 	cache := make(map[*ssa.Function]bool)
 
-	if StepwiseSoundnessEnabled {
-		return g.checkSummarySoundnessStepwise(function, summaryUnderCheck, 0, visited, cache)
+	return g.checkSummarySoundnessStepwise(function, summaryUnderCheck, 0, visited, cache)
+}
+
+// CheckExternalSummaries is a wrapper around CheckSummarySoundness to check all external summaries.
+func (g *InterProceduralFlowGraph) CheckExternalSummaries() ([]*SummaryGraph, error) {
+	var unsoundSummaries []*SummaryGraph
+	if !g.IsBuilt() {
+		unsoundSummaries = g.BuildGraph()
 	}
 
-	return g.checkSummarySoundnessRecursive(function, summaryUnderCheck, 0, visited, cache)
+	var checkedFns = make(map[*ssa.Function]bool)
+
+	// Check all summaries that are part of the call graph
+	for function, summary := range g.Summaries {
+		if summary.IsExternal() {
+			isSound, reason, _ := g.CheckSummarySoundness(function, summary)
+			if !isSound {
+				// avoid duplicates
+				isNew := true
+				for _, unsound := range unsoundSummaries {
+					if unsound == summary {
+						isNew = false
+						break
+					}
+				}
+				if isNew {
+					unsoundSummaries = append(unsoundSummaries, summary)
+				}
+				g.AnalyzerState.Logger.Warnf("Unsound external summary for %s: %s", function.String(), reason)
+			}
+			checkedFns[function] = true
+		}
+	}
+
+	return unsoundSummaries, nil
 }
 
 // checkSummarySoundnessRecursive is the internal recursive implementation that checks soundness
@@ -1286,47 +1284,54 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
 			isExternalFunction := len(function.Blocks) == 0 || (len(function.Blocks) > 0 && len(function.Blocks[0].Instrs) == 0)
 
 			if isExternalFunction {
-				// For external functions like ServerCodec, we cannot run intra-procedural analysis
-				// because there's no implementation to analyze. Instead, we validate that the
-				// summary is a reasonable subset of the maximal possible summary for this function.
+				// For external functions, the summary must be a valid and intentional subset of
+				// the maximal summary. An empty summary is a subset, but is likely unsound.
+				// We require Su == Sg, unless Su is identity or empty, which are valid special cases.
 				g.AnalyzerState.Logger.Debugf("External leaf function %s: validating against maximal summary", function.Name())
 
-				// Create the most general summary for this external function
 				maximalSummary := g.createMostGeneralSummary(function)
 				if maximalSummary == nil {
-					// If we can't create maximal summary, accept the provided summary
-					g.AnalyzerState.Logger.Debugf("Cannot create maximal summary for external function %s, accepting provided summary", function.Name())
-					summaryUnderCheck.IsSound = true
-					cache[function] = true
-					return true, "Summary is sound: external function, cannot create maximal summary", nil
-				}
-
-				// For external functions, accept any summary that is a subset of the maximal summary
-				// This is sound because we're being conservative - the summary can't claim more flows than possible
-				if g.isSummarySubset(summaryUnderCheck, maximalSummary) {
-					summaryUnderCheck.IsSound = true
-					cache[function] = true
-					return true, "Summary is sound: external function subset of maximal flows", nil
-				} else {
-					// Log the differences for debugging
-					summaryFlows := g.extractParamFlows(summaryUnderCheck)
-					maximalFlows := g.extractParamFlows(maximalSummary)
-					g.AnalyzerState.Logger.Debugf("Summary flows (%d): %v", len(summaryFlows), summaryFlows)
-					g.AnalyzerState.Logger.Debugf("Maximal flows (%d): %v", len(maximalFlows), maximalFlows)
-
+					// This is a failure condition. We cannot verify the summary.
+					g.AnalyzerState.Logger.Debugf("Cannot create maximal summary for external function %s, assuming unsound", function.Name())
 					summaryUnderCheck.IsSound = false
 					cache[function] = false
-					return false, "Summary is unsound: external function has flows beyond maximal", nil
+					return false, "Summary is unsound: external function, cannot create maximal summary", nil
 				}
+
+				// Check for equivalence with the most general summary
+				if g.compareSummaries(summaryUnderCheck, maximalSummary) {
+					summaryUnderCheck.IsSound = true
+					cache[function] = true
+					return true, "Summary is sound: external function matches maximal flows (Sg)", nil
+				}
+
+				// Check for valid special cases: identity summary
+				identitySummary := g.createIdentitySummary(function)
+				if g.compareSummaries(summaryUnderCheck, identitySummary) {
+					summaryUnderCheck.IsSound = true
+					cache[function] = true
+					return true, "Summary is sound: external function is identity", nil
+				}
+
+				// If it's not Sg and not identity, it's an invalid partial summary.
+				summaryFlows := g.extractParamFlows(summaryUnderCheck)
+				maximalFlows := g.extractParamFlows(maximalSummary)
+				g.AnalyzerState.Logger.Debugf("Summary flows (%d): %v", len(summaryFlows), summaryFlows)
+				g.AnalyzerState.Logger.Debugf("Maximal flows (%d): %v", len(maximalFlows), maximalFlows)
+
+				summaryUnderCheck.IsSound = false
+				cache[function] = false
+				return false, "Summary is unsound: external function has a partial summary that is not a recognized pattern (full or identity)", nil
+
 			} else {
 				// For internal leaf functions, run intra-procedural analysis to get ground truth flows
 				intraSummary, err := g.PerformDataflowAnalysis(function)
 				if err != nil {
-					// If intra-procedural analysis fails, fall back to accepting the summary
+					// If intra-procedural analysis fails, we cannot verify the summary, so it is unsound.
 					g.AnalyzerState.Logger.Warnf("Intra-procedural analysis failed for leaf function %s: %v", function.Name(), err)
-					summaryUnderCheck.IsSound = true
-					cache[function] = true
-					return true, "Summary is sound: leaf function, intra-procedural analysis failed but accepting summary", nil
+					summaryUnderCheck.IsSound = false
+					cache[function] = false
+					return false, "Summary is unsound: leaf function, intra-procedural analysis failed", nil
 				}
 
 				// Compare summary under check against intra-procedural result
@@ -1335,17 +1340,17 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessRecursive(
 					summaryUnderCheck.IsSound = true
 					cache[function] = true
 					return true, "Summary is sound: covers all actual parameter flows", nil
-				} else {
-					// Log the differences for debugging
-					summaryFlows := g.extractParamFlows(summaryUnderCheck)
-					intraFlows := g.extractParamFlows(intraSummary)
-					g.AnalyzerState.Logger.Debugf("Summary flows (%d): %v", len(summaryFlows), summaryFlows)
-					g.AnalyzerState.Logger.Debugf("Intra-procedural flows (%d): %v", len(intraFlows), intraFlows)
-
-					summaryUnderCheck.IsSound = false
-					cache[function] = false
-					return false, "Summary is unsound: missing some actual parameter flows", nil
 				}
+
+				// Log the differences for debugging
+				summaryFlows := g.extractParamFlows(summaryUnderCheck)
+				intraFlows := g.extractParamFlows(intraSummary)
+				g.AnalyzerState.Logger.Debugf("Summary flows (%d): %v", len(summaryFlows), summaryFlows)
+				g.AnalyzerState.Logger.Debugf("Intra-procedural flows (%d): %v", len(intraFlows), intraFlows)
+
+				summaryUnderCheck.IsSound = false
+				cache[function] = false
+				return false, "Summary is unsound: missing some actual parameter flows", nil
 			}
 		}
 
@@ -1498,6 +1503,21 @@ func (g *InterProceduralFlowGraph) createMostGeneralSummary(function *ssa.Functi
 	// For each callsite, find caller parameters that flow into any call argument.
 	// Add param→param edges between all such parameters and param→return edges to all returns.
 	g.augmentCallerParamInterferenceForFullCallees(maximal)
+
+	// If there are no callees, the intra-procedural analysis is all we have,
+	// but we still need to ensure it represents the "most general" case,
+	// which means full flow between params and returns.
+	if len(maximal.Callees) == 0 {
+		maximal.BuildFullFlowGraph()
+	}
+
+	// If there are no callees, the intra-procedural analysis is all we have,
+	// but we still need to ensure it represents the "most general" case,
+	// which means full flow between params and returns.
+	if len(maximal.Callees) == 0 {
+		maximal.BuildFullFlowGraph()
+	}
+
 	maximal.Constructed = true
 	maximal.IsSound = true
 	return maximal
@@ -1813,6 +1833,28 @@ func (g *InterProceduralFlowGraph) createMostPreservedSummary(function *ssa.Func
 	return summary
 }
 
+// createIdentitySummary creates a summary with identity flows (param -> return).
+func (g *InterProceduralFlowGraph) createIdentitySummary(function *ssa.Function) *SummaryGraph {
+	id := GetUniqueFunctionID()
+	summary := NewSummaryGraph(g.AnalyzerState, function, id, IsNodeOfInterest, nil)
+	g.createExternalFunctionNodes(summary, function)
+	summary.BuildIdentityGraph()
+	summary.Constructed = true
+	summary.IsSound = true
+	return summary
+}
+
+// createEmptySummary creates a summary with no flows.
+func (g *InterProceduralFlowGraph) createEmptySummary(function *ssa.Function) *SummaryGraph {
+	id := GetUniqueFunctionID()
+	summary := NewSummaryGraph(g.AnalyzerState, function, id, IsNodeOfInterest, nil)
+	g.createExternalFunctionNodes(summary, function)
+	summary.BuildEmptyGraph()
+	summary.Constructed = true
+	summary.IsSound = true
+	return summary
+}
+
 // extractParamFlows extracts parameter-to-parameter and parameter-to-return flows from a summary,
 // using transitive closure to find all reachable parameters and returns, ignoring self-loops.
 func (g *InterProceduralFlowGraph) extractParamFlows(summary *SummaryGraph) map[string]bool {
@@ -2036,17 +2078,21 @@ func (g *InterProceduralFlowGraph) compareEdgeInfo(ei1, ei2 EdgeInfo) bool {
 	}
 
 	// Check if all paths in ei1 exist in ei2
-	for inPath1, outPaths1 := range ei1.RelPath {
+	for inPath1, outPathMap := range ei1.RelPath {
+		clonedOutPathMap := make(map[string]bool)
+		for outPath, val := range outPathMap {
+			clonedOutPathMap[outPath] = val
+		}
 		outPaths2, exists := ei2.RelPath[inPath1]
 		if !exists {
 			return false
 		}
 
-		if len(outPaths1) != len(outPaths2) {
+		if len(outPaths2) != len(clonedOutPathMap) {
 			return false
 		}
 
-		for outPath1 := range outPaths1 {
+		for outPath1 := range clonedOutPathMap {
 			if _, exists := outPaths2[outPath1]; !exists {
 				return false
 			}
@@ -2712,8 +2758,6 @@ func (g *InterProceduralFlowGraph) createMaximalSummaryWithSubspec(function *ssa
 		_, err := RunIntraProcedural(g.AnalyzerState, testSummary)
 		if err != nil {
 			// If analysis fails, fall back to the original maximal summary
-			g.AnalyzerState.Logger.Debugf("Failed to re-analyze function %v with subspec %s for callee %v: %v",
-				function, subspecType, targetCallee, err)
 			return maximalSummary
 		}
 	}

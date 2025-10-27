@@ -206,6 +206,12 @@ func GetTargets(c *config.Config, reqs TargetReqs) (map[string]config.TargetInfo
 	case config.SyntacticTool:
 		addTargets(targetsToAnalyze, c.SyntacticProblems.StructInitProblems, allTargets, reqs.Tag, reqs.Platform)
 		addTargets(targetsToAnalyze, c.SyntacticProblems.CondCheckSpecs, allTargets, reqs.Tag, reqs.Platform)
+	case config.CheckTool:
+		// check tool does not have targets in the config file
+		if len(reqs.CmdlineArgs) > 0 {
+			return map[string]config.TargetInfo{"": {Patterns: reqs.CmdlineArgs, Platform: reqs.Platform}}, nil
+		}
+		return map[string]config.TargetInfo{}, nil
 	default:
 		return allTargets, nil
 	}

@@ -15,9 +15,13 @@
 package dataflow
 
 import (
+	"fmt"
 	"go/types"
+	"strings"
 	"sync/atomic"
 
+	"github.com/awslabs/ar-go-tools/analysis/lang"
+	"github.com/awslabs/ar-go-tools/analysis/summaries"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -37,59 +41,73 @@ func GetUniqueFunctionID() uint32 {
 	return x
 }
 
-// ComputeMethodImplementations populates a map from method implementation type string to the different implementations
-// corresponding to that method.
-// The map can be indexed by using the signature of an interface method and calling String() on it.
-// If the provided contracts map is non-nil, then the function also builds a summary graph for each interface
-// method such that contracts[methodId] = nil
-func ComputeMethodImplementations(p *ssa.Program, implementations map[string]map[*ssa.Function]bool,
-	contracts map[string]*SummaryGraph, keys map[string]string) error {
-	interfaceTypes := map[*ssa.Type]map[string]*types.Selection{}
-	signatureTypes := map[string]bool{} // TODO: use this to index function by signature
-	// Fetch all interface types
-	for _, pkg := range p.AllPackages() {
-		for _, mem := range pkg.Members {
-			switch memType := mem.(type) {
-			case *ssa.Type:
-				switch iType := memType.Type().Underlying().(type) {
-				case *types.Interface:
-					interfaceTypes[memType] = methodSetToNameMap(p.MethodSets.MethodSet(memType.Type()))
-				case *types.Signature:
-					signatureTypes[iType.String()] = true
-				}
+// ResolveFunction resolves a function summary to an ssa.Function
+func ResolveFunction(prog *ssa.Program, summary summaries.FrontendDataflowSummary) (*ssa.Function, error) {
+	switch s := summary.(type) {
+	case summaries.FunctionFlowSummary:
+		return lang.FindFunction(prog, s.Function), nil
+	case summaries.ReceiverMethodFlowSummary:
+		return lang.FindMethodForType(prog, s.Receiver, s.Method), nil
+	case summaries.IfaceMethodFlowSummary:
+		// We don't resolve interface methods to a specific implementation here.
+		// This is handled by the contract mechanism.
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unknown summary type")
+	}
+}
+
+// ComputeMethodImplementations computes the map from method identifiers to their implementations.
+func ComputeMethodImplementations(prog *ssa.Program,
+	implementationsByType map[string]map[*ssa.Function]bool,
+	contracts map[string]*SummaryGraph,
+	methodKeys map[string]string) error {
+	for _, t := range prog.RuntimeTypes() {
+		mset := prog.MethodSets.MethodSet(t)
+		for i := 0; i < mset.Len(); i++ {
+			meth := mset.At(i)
+			if meth.Obj() == nil {
+				continue
 			}
+			if meth.Obj().Pkg() == nil {
+				continue
+			}
+			if meth.Obj().Type() == nil {
+				continue
+			}
+
+			if _, ok := meth.Obj().Type().(*types.Signature); !ok {
+				continue
+			}
+
+			implementingFunction := prog.MethodValue(meth)
+			if implementingFunction == nil {
+				continue
+			}
+
+			methodID := meth.Obj().Id()
+			if !strings.Contains(methodID, "(") {
+				methodID = fmt.Sprintf("%s.%s", t.String(), meth.Obj().Name())
+			}
+
+			if _, ok := implementationsByType[methodID]; !ok {
+				implementationsByType[methodID] = map[*ssa.Function]bool{}
+			}
+			implementationsByType[methodID][implementingFunction] = true
+			methodKeys[implementingFunction.String()] = methodID
 		}
 	}
 
-	// Fetch implementations of all interface methods
-
-	for interfaceType, interfaceMethods := range interfaceTypes {
-		for _, typ := range p.RuntimeTypes() {
-			// Find the interfaces it implements (type conversion cannot fail)
-			if types.Implements(typ.Underlying(), interfaceType.Type().Underlying().(*types.Interface)) {
-				set := p.MethodSets.MethodSet(typ)
-				for i := 0; i < set.Len(); i++ {
-					method := set.At(i)
-					// Get the function implementation
-					methodValue := p.MethodValue(method)
-					if methodValue == nil {
-						continue
-					}
-					// Get the interface method being implemented
-					matchingInterfaceMethod := interfaceMethods[methodValue.Name()]
-					if matchingInterfaceMethod != nil {
-						key := matchingInterfaceMethod.Recv().String() + "." + methodValue.Name()
-						keys[methodValue.String()] = key
-						addImplementation(implementations, key, methodValue)
-						addContractSummaryGraph(contracts, key, methodValue, GetUniqueFunctionID())
-					}
-				}
+	// Also add contract implementations to the map
+	for methodID, summary := range contracts {
+		if summary != nil {
+			if _, ok := implementationsByType[methodID]; !ok {
+				implementationsByType[methodID] = map[*ssa.Function]bool{}
 			}
+			implementationsByType[methodID][summary.Parent] = true
 		}
 	}
-
-	computeErrorBuiltinImplementations(p, implementations, contracts, keys)
-
+	computeErrorBuiltinImplementations(prog, implementationsByType, contracts, methodKeys)
 	return nil
 }
 

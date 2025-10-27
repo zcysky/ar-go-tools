@@ -1,0 +1,81 @@
+dataflow-summaries:
+  - package: "slices"
+    function: "symMergeCmpFunc[internal/fmtsort.KeyValue]"
+    flows:
+      - from: "!arg 0"  # Input slice (modified in-place)
+        to: "!arg 0"
+      - from: "!arg 1"  # Low index
+        to: "!arg 0"
+      - from: "!arg 2"  # Mid index
+        to: "!arg 0"
+      - from: "!arg 3"  # High index
+        to: "!arg 0"
+      - from: "!arg 4"  # Comparison function
+        to: "!arg 0"
+
+  - package: "slices"
+    function: "partitionEqualCmpFunc"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"    # Modified slice
+      - from: "!arg 1"  # Equality function
+        to: "!arg 0"    # Modified slice
+
+  - package: "slices"
+    function: "partitionOrdered[int]"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"    # Modified slice
+
+  - package: "slices"
+    function: "partitionOrdered[rune]"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"
+      - from: "!arg 0"  # Slice elements
+        to: "!ret"
+      - from: "!arg 1"  # Low index
+        to: "!ret"
+      - from: "!arg 2"  # High index
+        to: "!ret"
+
+  - package: "slices"
+    function: "pdqsortOrdered[int]"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"
+      - from: "!arg 1"  # Low index
+        to: "!arg 0"
+
+
+  - package: "slices"
+    function: "pdqsortOrdered[rune]"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"
+      - from: "!arg 1"  # Low index
+        to: "!arg 0"
+      - from: "!arg 2"  # High index
+        to: "!arg 0"
+      - from: "!arg 3"  # Limit counter
+        to: "!arg 0"
+
+  - package: "slices"
+    function: "partialInsertionSortOrdered[int]"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"
+      - from: "!arg 1"  # Low index
+        to: "!arg 0"
+      - from: "!arg 2"  # High index
+        to: "!arg 0"
+
+  - package: "slices"
+    function: "partialInsertionSortOrdered[rune]"
+    flows:
+      - from: "!arg 0"  # Input slice
+        to: "!arg 0"
+      - from: "!arg 1"  # Low index
+        to: "!arg 0"
+      - from: "!arg 2"  # High index
+        to: "!arg 0"

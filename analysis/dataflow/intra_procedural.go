@@ -15,7 +15,6 @@
 package dataflow
 
 import (
-	"context"
 	"fmt"
 	"go/types"
 	"strings"
@@ -259,142 +258,7 @@ func RunIntraProcedural(a *State, sm *SummaryGraph) (time.Duration, error) {
 	if sm == nil {
 		return 0, fmt.Errorf("summary graph is nil")
 	}
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	// Use buffered channel to prevent blocking
-	done := make(chan analysisResult, 1)
-
-	// Start analysis goroutine
-	go func() {
-		// defer func() {
-		// 	if r := recover(); r != nil {
-		// 		// Handle panic in goroutine
-		// 		funcName := "unknown"
-		// 		if sm != nil && sm.Parent != nil {
-		// 			funcName = formatutil.Sanitize(sm.Parent.String())
-		// 		}
-		// 		a.Logger.Errorf("Panic in intra-procedural analysis for function %s: %v", funcName, r)
-		// 		select {
-		// 		case done <- analysisResult{duration: 0, err: fmt.Errorf("analysis panicked: %v", r)}:
-		// 		default:
-		// 			// Channel might be closed, ignore
-		// 		}
-		// 	}
-		// }()
-		start := time.Now()
-		err := runOriginalAnalysisWithContext(ctx, a, sm)
-		elapsed := time.Since(start)
-
-		// Try to send result, but don't block if timeout already happened
-		select {
-		case done <- analysisResult{duration: elapsed, err: err}:
-		default:
-			// Analysis was cancelled, ignore result
-		}
-	}()
-
-	// Wait for either completion or timeout
-	select {
-	case result := <-done:
-		// Analysis completed within timeout
-		return result.duration, result.err
-	case <-ctx.Done():
-		// Timeout occurred
-		if a.Logger != nil {
-			funcName := "unknown"
-			if sm != nil && sm.Parent != nil {
-				funcName = formatutil.Sanitize(sm.Parent.String())
-			}
-			a.Logger.Warnf("Function %s is cancelled due to time out", funcName)
-		}
-
-		// Build full graph as replacement
-		start := time.Now()
-		sm.BuildFullFlowGraph()
-		sm.Constructed = true
-		elapsed := time.Since(start)
-
-		return elapsed, nil
-	}
-}
-
-// // runOriginalAnalysis contains the original RunIntraProcedural logic
-// it is temporarily removed by the timing feature
-// func runOriginalAnalysis(a *State, sm *SummaryGraph) error {
-// 	flowInfo := NewFlowInfo(a.Config, sm.Parent)
-// 	// This is the only place an IntraAnalysisState is initialized
-// 	state := &IntraAnalysisState{
-// 		flowInfo:            flowInfo,
-// 		parentAnalyzerState: a,
-// 		changeFlag:          true,
-// 		blocksSeen:          make([]bool, flowInfo.NumBlocks),
-// 		errors:              map[ssa.Node]error{},
-// 		summary:             sm,
-// 		deferStacks:         defers.AnalyzeFunction(sm.Parent, a.Logger),
-// 		paths:               make([]*ConditionInfo, flowInfo.NumBlocks*flowInfo.NumBlocks),
-// 		instrPrev:           make([]map[IndexT]bool, flowInfo.NumInstructions),
-// 		paramAliases:        make([]map[*ssa.Parameter]bool, flowInfo.NumValues),
-// 		freeVarAliases:      make([]map[*ssa.FreeVar]bool, flowInfo.NumValues),
-// 		shouldTrack:         sm.shouldTrack,
-// 		postBlockCallback:   sm.postBlockCallBack,
-// 	}
-
-// 	reportUnsoundFeatures(a, sm.Parent)
-
-// 	// Output warning if defer stack is unbounded
-// 	if !state.deferStacks.DeferStackBounded {
-// 		a.Logger.Warnf("Defer stack unbounded in %s: %s",
-// 			formatutil.Sanitize(sm.Parent.String()), formatutil.Yellow("analysis unsound!"))
-// 	}
-// 	// First, we initialize the state of the monotone framework analysis (see the initialize function for more details)
-// 	state.initialize()
-// 	// Once the state is initialized, we call the forward iterative monotone framework analysis. The algorithm is
-// 	// defined generally in the lang package, but all the details, including transfer functions, are in the
-// 	// single_function_monotone_analysis.go file
-// 	lang.RunForwardIterative(state, sm.Parent)
-// 	// Once the analysis has RunIntraProcedural, we have a state that maps each instruction to an abstract Value at
-// 	// that instruction.  This abstract valuation maps values to the values that flow into them. This can directly be
-// 	// translated into a dataflow graph, with special attention for closures.
-// 	// Next, we build the edges of the summary. The functions for edge building are in this file
-// 	lang.IterateInstructions(sm.Parent, state.makeEdgesAtInstruction)
-// 	// Synchronize the edges of global variables
-// 	sm.SyncGlobals()
-// 	// Update the locsets / marks of the nodes. The locsets are elements that can be used to check results against
-// 	// other analyses. Currently, the locsets are the set of instructions that the data represented by a given node
-// 	// flows to.
-// 	state.moveLocSetsToSummary()
-// 	// Mark the summary as constructed
-// 	sm.Constructed = true
-// 	// If we have errors, return one. This is sufficient to warn the user that the results are incorrect.
-// 	// TODO: manage error messages for better debugging
-// 	for _, err := range state.errors {
-// 		return fmt.Errorf("error in intraprocedural analysis: %w", err)
-// 	}
-// 	return nil
-// }
-
-// runOriginalAnalysisWithContext contains the context-aware RunIntraProcedural logic with cancellation support
-func runOriginalAnalysisWithContext(ctx context.Context, a *State, sm *SummaryGraph) error {
-	// Check for cancellation at the start
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	// // Validate inputs before starting analysis
-	// if sm == nil {
-	// 	return fmt.Errorf("summary graph is nil")
-	// }
-	// if sm.Parent == nil {
-	// 	return fmt.Errorf("function is nil")
-	// }
-	// if len(sm.Parent.Blocks) == 0 {
-	// 	return fmt.Errorf("function has no blocks")
-	// }
+	start := time.Now()
 
 	flowInfo := NewFlowInfo(a.Config, sm.Parent)
 	// This is the only place an IntraAnalysisState is initialized
@@ -414,67 +278,24 @@ func runOriginalAnalysisWithContext(ctx context.Context, a *State, sm *SummaryGr
 		postBlockCallback:   sm.postBlockCallBack,
 	}
 
-	// Check for cancellation after initialization
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
 	reportUnsoundFeatures(a, sm.Parent)
 
 	// Output warning if defer stack is unbounded
 	if !state.deferStacks.DeferStackBounded {
-		funcName := "unknown"
-		if sm != nil && sm.Parent != nil {
-			funcName = formatutil.Sanitize(sm.Parent.String())
-		}
-		a.Logger.Warnf("Defer stack unbounded in %s: %s", funcName, formatutil.Yellow("analysis unsound!"))
+		a.Logger.Warnf("Defer stack unbounded in %s: %s",
+			formatutil.Sanitize(sm.Parent.String()), formatutil.Yellow("analysis unsound!"))
 	}
-
-	// Check for cancellation before heavy computation
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
 	// First, we initialize the state of the monotone framework analysis (see the initialize function for more details)
 	state.initialize()
-
-	// Check for cancellation before the most intensive part
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
 	// Once the state is initialized, we call the forward iterative monotone framework analysis. The algorithm is
 	// defined generally in the lang package, but all the details, including transfer functions, are in the
 	// single_function_monotone_analysis.go file
-	// This is the most time-consuming part of the analysis
 	lang.RunForwardIterative(state, sm.Parent)
-
-	// Check for cancellation after forward iterative analysis
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
 	// Once the analysis has RunIntraProcedural, we have a state that maps each instruction to an abstract Value at
 	// that instruction.  This abstract valuation maps values to the values that flow into them. This can directly be
 	// translated into a dataflow graph, with special attention for closures.
 	// Next, we build the edges of the summary. The functions for edge building are in this file
 	lang.IterateInstructions(sm.Parent, state.makeEdgesAtInstruction)
-
-	// Check for cancellation after edge building
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
 	// Synchronize the edges of global variables
 	sm.SyncGlobals()
 	// Update the locsets / marks of the nodes. The locsets are elements that can be used to check results against
@@ -486,9 +307,9 @@ func runOriginalAnalysisWithContext(ctx context.Context, a *State, sm *SummaryGr
 	// If we have errors, return one. This is sufficient to warn the user that the results are incorrect.
 	// TODO: manage error messages for better debugging
 	for _, err := range state.errors {
-		return fmt.Errorf("error in intraprocedural analysis: %w", err)
+		return time.Since(start), fmt.Errorf("error in intraprocedural analysis: %w", err)
 	}
-	return nil
+	return time.Since(start), nil
 }
 
 // Dataflow edges in the summary graph are added by the following functions. Those can be called after the iterative

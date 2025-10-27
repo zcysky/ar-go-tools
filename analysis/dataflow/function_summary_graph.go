@@ -254,6 +254,11 @@ func (g *SummaryGraph) ReturnType() *types.Tuple {
 	return nil
 }
 
+// IsExternal returns true if the function summarized is external (has no code).
+func (g *SummaryGraph) IsExternal() bool {
+	return lang.IsExternal(g.Parent)
+}
+
 // SyncGlobals must be executed after the summary is built in order to synchronize the information between the
 // global access node (write or read to a global in the function) and the GlobalNode that tracks the information
 // about read and write locations of that global.

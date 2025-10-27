@@ -21,6 +21,7 @@ import (
 	"github.com/awslabs/ar-go-tools/analysis"
 	"github.com/awslabs/ar-go-tools/analysis/config"
 	"github.com/awslabs/ar-go-tools/cmd/argot/backtrace"
+	"github.com/awslabs/ar-go-tools/cmd/argot/check"
 	"github.com/awslabs/ar-go-tools/cmd/argot/cli"
 	"github.com/awslabs/ar-go-tools/cmd/argot/compare"
 	"github.com/awslabs/ar-go-tools/cmd/argot/defers"
@@ -40,6 +41,7 @@ Usage:
   argot [tool] [options] <Go file path(s)>
 Tools:
   - taint: performs a taint analysis on a given program
+  - check: performs a external summary soundness check on a given program
   - backtrace: identifies backwards data-flow traces from function calls
   - syntactic: runs some syntactic analyses using the SSA representation
   - cli: interactive terminal-like interface for parts of the analysis
@@ -82,6 +84,14 @@ func main() {
 			errExit(err)
 		}
 		if err := backtrace.Run(flags); err != nil {
+			errExit(err)
+		}
+	case "check":
+		flags, err := check.NewFlags(args)
+		if err != nil {
+			errExit(err)
+		}
+		if err := check.Run(flags); err != nil {
 			errExit(err)
 		}
 	case config.CliTool:

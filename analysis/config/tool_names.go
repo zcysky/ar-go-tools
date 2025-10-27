@@ -38,8 +38,10 @@ const (
 	RenderTool ToolName = "render"
 	// SsaStatisticsTool name
 	SsaStatisticsTool ToolName = "ssa-statistics"
-	// SyntacticTool name
+	// SyntacticTool is the name of the syntactic analysis tool
 	SyntacticTool ToolName = "syntactic"
 	// TaintTool name
 	TaintTool ToolName = "taint"
+	// CheckTool is the name of the external summary soundness check tool
+	CheckTool ToolName = "check"
 )
