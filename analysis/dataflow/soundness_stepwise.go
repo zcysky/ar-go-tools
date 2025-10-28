@@ -38,12 +38,12 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessStepwise(
 
 	// Step1: full-flow equality shortcut
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP1] func=%s begin", function.String())
+		g.AnalyzerState.Logger.Debugf("[STEP1: MOST GENERAL] func=%s begin", function.String())
 	}
 	full := createFullFlowSummary(summaryUnderCheck)
 	if g.compareSummaries(summaryUnderCheck, full) {
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP1] func=%s status=equals-full-flow -> SOUND", function.String())
+			g.AnalyzerState.Logger.Debugf("[STEP1: MOST GENERAL] func=%s status=equals-full-flow -> SOUND", function.String())
 		}
 		summaryUnderCheck.IsSound = true
 		cache[function] = true
@@ -58,67 +58,67 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessStepwise(
 	// Missing flows: parameter/return only
 	missing := g.stepwiseFindMissing(summaryUnderCheck, Sg)
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP1] func=%s initial-missing=%d", function.String(), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP1: MOST GENERAL] func=%s initial-missing=%d", function.String(), len(missing))
 	}
 	// With Sg = S_full and equality already excluded above, missing must be > 0 here.
 
 	// Step2: simple type infeasible
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP2] func=%s start remaining=%d", function.String(), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] func=%s start remaining=%d", function.String(), len(missing))
 	}
 	before := len(missing)
 	missing = g.filterMissingSimpleType(missing)
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP2] func=%s removed=%d remain=%d", function.String(), before-len(missing), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] func=%s removed=%d remain=%d", function.String(), before-len(missing), len(missing))
 	}
 	if len(missing) == 0 {
 		summaryUnderCheck.IsSound = true
 		cache[function] = true
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP2] func=%s status=all-type-infeasible -> SOUND", function.String())
+			g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] func=%s status=all-type-infeasible -> SOUND", function.String())
 		}
 		return true, "all type-infeasible", nil
 	}
 
 	// Step3: immutability-based pruning
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP3] func=%s start remaining=%d", function.String(), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] func=%s start remaining=%d", function.String(), len(missing))
 	}
 	before = len(missing)
 	missing = g.filterMissingImmutability(function, summaryUnderCheck, missing)
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP3] func=%s removed=%d remain=%d", function.String(), before-len(missing), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] func=%s removed=%d remain=%d", function.String(), before-len(missing), len(missing))
 	}
 	if len(missing) == 0 {
 		summaryUnderCheck.IsSound = true
 		cache[function] = true
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP3] func=%s status=cleared-by-immutability -> SOUND", function.String())
+			g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] func=%s status=cleared-by-immutability -> SOUND", function.String())
 		}
 		return true, "cleared by immutability", nil
 	}
 
 	// Step4: reaching-def with full-call assumption
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP4] func=%s start remaining=%d", function.String(), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP4: REACH-DEFs] func=%s start remaining=%d", function.String(), len(missing))
 	}
 	before = len(missing)
 	missing = g.filterMissingReachingFull(function, missing)
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP4] func=%s removed=%d remain=%d", function.String(), before-len(missing), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP4: REACH-DEFs] func=%s removed=%d remain=%d", function.String(), before-len(missing), len(missing))
 	}
 	if len(missing) == 0 {
 		summaryUnderCheck.IsSound = true
 		cache[function] = true
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP4] func=%s status=cleared-by-reaching-full -> SOUND", function.String())
+			g.AnalyzerState.Logger.Debugf("[STEP4: REACH-DEFs] func=%s status=cleared-by-reaching-full -> SOUND", function.String())
 		}
 		return true, "cleared by reaching(full)", nil
 	}
 
 	// Step5: recursive + subspec using remaining flows directly
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP5] func=%s start remaining=%d", function.String(), len(missing))
+		g.AnalyzerState.Logger.Debugf("[STEP5: RECURSIVE] func=%s start remaining=%d", function.String(), len(missing))
 	}
 	// Reuse existing machinery (identifyPotentialCalleeSubspecs expects NodePair slice from older path; we build mapping)
 	rc := g.recursivelyCheckAllCallees(summaryUnderCheck, recursionDepth, visited, cache)
@@ -143,33 +143,33 @@ func (g *InterProceduralFlowGraph) checkSummarySoundnessStepwise(
 		}
 		if rc.AllCalleesSound {
 			if g.AnalyzerState.Logger.LogsDebug() {
-				g.AnalyzerState.Logger.Debugf("[SND STEP5] func=%s fail missing=%d no-subspec-options", function.String(), len(missing))
+				g.AnalyzerState.Logger.Debugf("[STEP5: RECURSIVE] func=%s fail missing=%d no-subspec-options", function.String(), len(missing))
 			}
 			return false, fmt.Sprintf("missing=%d no subspec options", len(missing)), nil
 		}
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP5] func=%s fail missing=%d callee-unsound=%s", function.String(), len(missing), rc.FirstFailureReason)
+			g.AnalyzerState.Logger.Debugf("[STEP5: RECURSIVE] func=%s fail missing=%d callee-unsound=%s", function.String(), len(missing), rc.FirstFailureReason)
 		}
 		return false, fmt.Sprintf("missing=%d callee unsound %s", len(missing), rc.FirstFailureReason), nil
 	}
 	cover := g.greedySetCoverAlgorithm(options, missing)
 	if len(cover.Uncovered) > 0 {
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP5] func=%s fail uncovered=%d after set-cover", function.String(), len(cover.Uncovered))
+			g.AnalyzerState.Logger.Debugf("[STEP5: RECURSIVE] func=%s fail uncovered=%d after set-cover", function.String(), len(cover.Uncovered))
 		}
 		return false, fmt.Sprintf("uncovered=%d after set-cover", len(cover.Uncovered)), nil
 	}
 	deeper, err := g.generateSelectedSubspecsWithRecursiveCheck(summaryUnderCheck, cover, recursionDepth, visited, cache)
 	if err != nil {
 		if g.AnalyzerState.Logger.LogsDebug() {
-			g.AnalyzerState.Logger.Debugf("[SND STEP5] func=%s fail recursive-subspec err=%v", function.String(), err)
+			g.AnalyzerState.Logger.Debugf("[STEP5: RECURSIVE] func=%s fail recursive-subspec err=%v", function.String(), err)
 		}
 		return false, fmt.Sprintf("recursive subspec fail: %v", err), nil
 	}
 	summaryUnderCheck.IsSound = true
 	cache[function] = true
 	if g.AnalyzerState.Logger.LogsDebug() {
-		g.AnalyzerState.Logger.Debugf("[SND STEP5] func=%s status=sound-via-subspec flows=%d callees=%d -> SOUND", function.String(), len(missing), len(deeper))
+		g.AnalyzerState.Logger.Debugf("[STEP5: RECURSIVE] func=%s status=sound-via-subspec flows=%d callees=%d -> SOUND", function.String(), len(missing), len(deeper))
 	}
 	return true, fmt.Sprintf("sound via subspec (%d flows, %d callees)", len(missing), len(deeper)), deeper
 }
@@ -217,7 +217,7 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 			if tp, ok2 := mp.Target.(*ParamNode); ok2 && sp.argPos != tp.argPos {
 				if st == nil || dt == nil || !types.Identical(st, dt) {
 					if g.AnalyzerState.Logger.LogsDebug() {
-						g.AnalyzerState.Logger.Debugf("[SND STEP2] drop %s -> %s param-param non-identical", mp.Source.String(), mp.Target.String())
+						g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s param-param non-identical", mp.Source.String(), mp.Target.String())
 					}
 					continue
 				}
@@ -225,7 +225,7 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 		}
 		if g.simpleTypeInfeasible(st, dt) {
 			if g.AnalyzerState.Logger.LogsDebug() {
-				g.AnalyzerState.Logger.Debugf("[SND STEP2] drop %s -> %s type-infeasible", mp.Source.String(), mp.Target.String())
+				g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s type-infeasible", mp.Source.String(), mp.Target.String())
 			}
 			continue
 		}
@@ -290,43 +290,92 @@ func (g *InterProceduralFlowGraph) containsPointer(t types.Type) bool {
 
 // --- Step3 immutability ---
 func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Function, summary *SummaryGraph, missing []NodePair) []NodePair {
-	result := IsSpecSatisfyimmutable(summary)
-	if !result.IsSatisfied {
+	if function == nil || len(function.Params) == 0 {
 		return missing
 	}
-	ok, _ := CheckParametersimmutableInSSA(result, function)
-	if !ok {
-		return missing
-	}
-	// Build param index map
-	paramIndex := map[*ssa.Parameter]int{}
+
+	// --- Step 3.1: Identify parameters that are never modified (written to) ---
+	// This includes checking for stores to aliases of the parameter.
+	unmodifiedParams := make(map[int]bool)
 	for i, p := range function.Params {
-		paramIndex[p] = i
-	}
-	imm := map[int]bool{}
-	add := func(ps []*ssa.Parameter) {
-		for _, p := range ps {
-			if idx, ok := paramIndex[p]; ok {
-				imm[idx] = true
+		// A simple alias analysis: find all values derived from the parameter.
+		// A more robust analysis would use a proper pointer analysis library.
+		q := []ssa.Value{p}
+		visited := map[ssa.Value]bool{p: true}
+		isModified := false
+		for len(q) > 0 {
+			v := q[0]
+			q = q[1:]
+
+			if v.Referrers() == nil {
+				continue
+			}
+			for _, instr := range *v.Referrers() {
+				// Check for direct modification
+				if store, ok := instr.(*ssa.Store); ok && store.Addr == v {
+					isModified = true
+					break
+				}
+				// Check for modification via function call (conservative)
+				if call, ok := instr.(ssa.CallInstruction); ok {
+					for _, arg := range call.Common().Args {
+						if arg == v {
+							// Conservatively assume any function call can modify its arguments.
+							isModified = true
+							break
+						}
+					}
+				}
+				if isModified {
+					break
+				}
+
+				// Follow aliases
+				if val, ok := instr.(ssa.Value); ok {
+					if !visited[val] {
+						switch instr.(type) {
+						case *ssa.FieldAddr, *ssa.IndexAddr, *ssa.ChangeType, *ssa.Convert, *ssa.UnOp:
+							visited[val] = true
+							q = append(q, val)
+						}
+					}
+				}
+			}
+			if isModified {
+				break
 			}
 		}
-	}
-	add(result.NoLHSParams)
-	add(result.NoRHSParams)
-	add(result.NoFlowParams)
-	isImm := func(n GraphNode) bool {
-		if pn, ok := n.(*ParamNode); ok {
-			return imm[pn.argPos]
+		if !isModified {
+			unmodifiedParams[i] = true
 		}
-		return false
 	}
+
+	// --- Step 3.2: Identify parameters that are never read (used) ---
+	unusedParams := make(map[int]bool)
+	for i, p := range function.Params {
+		if p.Referrers() == nil || len(*p.Referrers()) == 0 {
+			unusedParams[i] = true
+		}
+	}
+
+	// --- Step 3.3: Filter missing flows ---
 	var out []NodePair
 	for _, mp := range missing {
-		if isImm(mp.Source) || isImm(mp.Target) {
-			if g.AnalyzerState.Logger.LogsDebug() {
-				g.AnalyzerState.Logger.Debugf("[SND STEP3] drop %s -> %s immut", mp.Source.String(), mp.Target.String())
+		if src, ok := mp.Source.(*ParamNode); ok {
+			if unusedParams[src.argPos] {
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] drop %s -> %s (source unused)", mp.Source.String(), mp.Target.String())
+				}
+				continue
 			}
-			continue
+		}
+		if tgt, ok := mp.Target.(*ParamNode); ok {
+			if unmodifiedParams[tgt.argPos] {
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] drop %s -> %s (target unmodified)", mp.Source.String(), mp.Target.String())
+				}
+				continue
+			}
 		}
 		out = append(out, mp)
 	}
@@ -407,7 +456,7 @@ func (g *InterProceduralFlowGraph) filterMissingReachingFull(function *ssa.Funct
 		}
 		if !keep {
 			if g.AnalyzerState.Logger.LogsDebug() {
-				g.AnalyzerState.Logger.Debugf("[SND STEP4] drop unreachable %s -> %s", pair.Source.String(), pair.Target.String())
+				g.AnalyzerState.Logger.Debugf("[STEP4: REACH-DEFs] drop unreachable %s -> %s", pair.Source.String(), pair.Target.String())
 			}
 			continue
 		}
