@@ -223,6 +223,13 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 				}
 			}
 		}
+		// Special-case: flows into return parameters should not be pruned by simple type checks.
+		// Even if types are not assignable, functions can still produce return values via conversions
+		// or intermediate computations. We therefore keep Param -> Return edges regardless of Assignable/Convertible.
+		if _, isReturn := mp.Target.(*ReturnValNode); isReturn {
+			out = append(out, mp)
+			continue
+		}
 		if g.simpleTypeInfeasible(st, dt) {
 			if g.AnalyzerState.Logger.LogsDebug() {
 				g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s type-infeasible", mp.Source.String(), mp.Target.String())
@@ -294,6 +301,12 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 		return missing
 	}
 
+	// Skip Step 3 for functions without SSA body (external/builtins),
+	// to avoid misclassifying params as unused/unmodified due to missing referrers.
+	if len(function.Blocks) == 0 {
+		return missing
+	}
+
 	// --- Step 3.1: Identify parameters that are never modified (written to) ---
 	// This includes checking for stores to aliases of the parameter.
 	unmodifiedParams := make(map[int]bool)
@@ -320,9 +333,11 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 				if call, ok := instr.(ssa.CallInstruction); ok {
 					for _, arg := range call.Common().Args {
 						if arg == v {
-							// Conservatively assume any function call can modify its arguments.
-							isModified = true
-							break
+							// Treat only pointer-like arguments as modifiable by calls
+							if g.containsPointer(v.Type()) {
+								isModified = true
+								break
+							}
 						}
 					}
 				}
@@ -351,9 +366,82 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 	}
 
 	// --- Step 3.2: Identify parameters that are never read (used) ---
+	// More precise than just "has referrers": recognize actual read uses.
 	unusedParams := make(map[int]bool)
 	for i, p := range function.Params {
-		if p.Referrers() == nil || len(*p.Referrers()) == 0 {
+		isRead := false
+		q := []ssa.Value{p}
+		visited := map[ssa.Value]bool{p: true}
+		for len(q) > 0 && !isRead {
+			v := q[0]
+			q = q[1:]
+			if v.Referrers() == nil {
+				continue
+			}
+			for _, instr := range *v.Referrers() {
+				// Reading cases
+				if store, ok := instr.(*ssa.Store); ok {
+					if store.Val == v { // value used as the stored value
+						isRead = true
+						break
+					}
+					// store.Addr == v is not a read
+					continue
+				}
+				// Dereference read: *v
+				if uop, ok := instr.(*ssa.UnOp); ok {
+					// token.MUL indicates dereference of address held in X
+					if uop.X == v {
+						isRead = true
+						break
+					}
+				}
+				if call, ok := instr.(ssa.CallInstruction); ok {
+					for _, arg := range call.Common().Args {
+						if arg == v {
+							isRead = true
+							break
+						}
+					}
+					if isRead {
+						break
+					}
+				}
+				if ret, ok := instr.(*ssa.Return); ok {
+					for _, rv := range ret.Results {
+						if rv == v {
+							isRead = true
+							break
+						}
+					}
+					if isRead {
+						break
+					}
+				}
+				if phi, ok := instr.(*ssa.Phi); ok {
+					for _, edge := range phi.Edges {
+						if edge == v {
+							isRead = true
+							break
+						}
+					}
+					if isRead {
+						break
+					}
+				}
+				// Follow aliases
+				if val, ok := instr.(ssa.Value); ok {
+					if !visited[val] {
+						switch instr.(type) {
+						case *ssa.FieldAddr, *ssa.IndexAddr, *ssa.ChangeType, *ssa.Convert, *ssa.UnOp:
+							visited[val] = true
+							q = append(q, val)
+						}
+					}
+				}
+			}
+		}
+		if !isRead {
 			unusedParams[i] = true
 		}
 	}
@@ -385,6 +473,11 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 // --- Step4 reaching-def with full-call assumption ---
 func (g *InterProceduralFlowGraph) filterMissingReachingFull(function *ssa.Function, missing []NodePair) []NodePair {
 	if function == nil || len(missing) == 0 {
+		return missing
+	}
+	// Skip Step 4 for functions without SSA body (external/builtins),
+	// as we cannot determine parameter reachability without function body.
+	if len(function.Blocks) == 0 {
 		return missing
 	}
 	pCount := len(function.Params)
