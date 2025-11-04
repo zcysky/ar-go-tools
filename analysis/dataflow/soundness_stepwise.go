@@ -212,24 +212,46 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 	for _, mp := range missing {
 		st := g.nodeType(mp.Source)
 		dt := g.nodeType(mp.Target)
-		// NEW: drop param->param edges whose types are not identical (positions differ) as infeasible
-		if sp, ok1 := mp.Source.(*ParamNode); ok1 {
-			if tp, ok2 := mp.Target.(*ParamNode); ok2 && sp.argPos != tp.argPos {
-				if st == nil || dt == nil || !types.Identical(st, dt) {
-					if g.AnalyzerState.Logger.LogsDebug() {
-						g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s param-param non-identical", mp.Source.String(), mp.Target.String())
-					}
-					continue
-				}
-			}
-		}
-		// Special-case: flows into return parameters should not be pruned by simple type checks.
-		// Even if types are not assignable, functions can still produce return values via conversions
-		// or intermediate computations. We therefore keep Param -> Return edges regardless of Assignable/Convertible.
+
+		// CRITICAL: flows into return parameters should NEVER be pruned by simple type checks.
+		// Even if types are not assignable or not pointer-like, functions can still produce
+		// return values via conversions or intermediate computations.
+		// We therefore keep ALL flows to return parameters regardless of any type analysis.
 		if _, isReturn := mp.Target.(*ReturnValNode); isReturn {
 			out = append(out, mp)
 			continue
 		}
+
+		// NEW LOGIC: For param-to-param flows, if both types cannot point (are not pointer-like),
+		// then there is no (non-local) dataflow between the two parameters inside the function.
+		if sp, ok1 := mp.Source.(*ParamNode); ok1 {
+			if tp, ok2 := mp.Target.(*ParamNode); ok2 {
+				// Use CanPoint logic to check if types are pointer-like
+				if st != nil && dt != nil {
+					srcCanPoint := g.canPoint(st)
+					dstCanPoint := g.canPoint(dt)
+
+					if !srcCanPoint && !dstCanPoint {
+						if g.AnalyzerState.Logger.LogsDebug() {
+							g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s param-param both non-pointer-like", mp.Source.String(), mp.Target.String())
+						}
+						continue
+					}
+				}
+
+				// Additional check: drop param->param edges whose types are not identical (positions differ) as infeasible
+				if sp.argPos != tp.argPos {
+					if st == nil || dt == nil || !types.Identical(st, dt) {
+						if g.AnalyzerState.Logger.LogsDebug() {
+							g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s param-param non-identical", mp.Source.String(), mp.Target.String())
+						}
+						continue
+					}
+				}
+			}
+		}
+
+		// Apply other type-based feasibility checks (but only for non-return targets)
 		if g.simpleTypeInfeasible(st, dt) {
 			if g.AnalyzerState.Logger.LogsDebug() {
 				g.AnalyzerState.Logger.Debugf("[STEP2: SIMPLE TYPE] drop %s -> %s type-infeasible", mp.Source.String(), mp.Target.String())
@@ -239,6 +261,21 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 		out = append(out, mp)
 	}
 	return out
+}
+
+// canPoint reports whether the type T is pointerlike, for the purposes of this analysis.
+// This is a local wrapper around pointer.CanPoint to avoid import issues.
+func (g *InterProceduralFlowGraph) canPoint(T types.Type) bool {
+	switch T := T.(type) {
+	case *types.Named:
+		if obj := T.Obj(); obj.Name() == "Value" && obj.Pkg().Path() == "reflect" {
+			return true // treat reflect.Value like interface{}
+		}
+		return g.canPoint(T.Underlying())
+	case *types.Pointer, *types.Interface, *types.Map, *types.Chan, *types.Signature, *types.Slice:
+		return true
+	}
+	return false // array struct tuple builtin basic
 }
 func (g *InterProceduralFlowGraph) nodeType(n GraphNode) types.Type {
 	switch x := n.(type) {

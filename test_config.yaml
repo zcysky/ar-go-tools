@@ -5,7 +5,7 @@ options:
   report-summaries: true
 
 dataflow-problems:
-  summarize-on-demand: false
+  summarize-on-demand: true
   taint-tracking:
     - tag: "user"
       sources:

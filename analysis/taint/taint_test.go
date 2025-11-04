@@ -225,13 +225,13 @@ func TestPlayground(t *testing.T) {
 }
 
 func TestBenchmark(t *testing.T) {
-	t.Parallel()
+	// t.Parallel()
 	t.Run("benchmark", func(t *testing.T) {
-		t.Parallel()
+		// t.Parallel()
 		runTestWithoutCheck(t, "benchmark", []string{}, false, noErrorExpected)
 	})
 	t.Run("benchmark-on-demand", func(t *testing.T) {
-		t.Parallel()
+		// t.Parallel()
 		runTestWithoutCheck(t, "benchmark", []string{}, true, noErrorExpected)
 	})
 }
