@@ -187,7 +187,7 @@ func RunCheck(targetName string, flags tools.CommonFlags, df *dataflow.State) (b
 	// BuildGraph now returns unsound summaries found during loading.
 	unsoundSummaries := df.FlowGraph.BuildGraph()
 	// CheckExternalSummaries will check the rest and append.
-	additionalUnsound, err := df.FlowGraph.CheckExternalSummaries()
+	additionalUnsound, stats, err := df.FlowGraph.CheckExternalSummaries()
 	if err != nil {
 		if df.Report != nil {
 			for _, checkErr := range df.Report.CheckError() {
@@ -221,6 +221,58 @@ func RunCheck(targetName string, flags tools.CommonFlags, df *dataflow.State) (b
 	df.Logger.Infof("")
 	df.Logger.Infof("External summary soundness check took %3.4f s", duration.Seconds())
 	df.Logger.Infof("")
+
+	// Print statistics
+	if stats != nil {
+		// Adjust statistics based on the actual final unsound summaries list.
+		// The issue is that BuildGraph() may find unsound summaries that, when re-checked
+		// in CheckExternalSummaries(), are marked as sound (possibly due to caching or
+		// non-deterministic checks). However, if BuildGraph() found them as unsound,
+		// we should trust that result as the authoritative one.
+		actualUnsoundCount := len(unsoundSummaries)
+		if actualUnsoundCount != stats.UnsoundCount {
+			// Adjust the counts: if we have more unsound summaries than reported,
+			// we need to adjust the stats to match reality
+			diff := actualUnsoundCount - stats.UnsoundCount
+			if diff > 0 {
+				// Some unsound summaries were found but not counted in stats
+				stats.UnsoundCount = actualUnsoundCount
+				// Adjust sound count accordingly (these summaries were incorrectly counted as sound)
+				if stats.SoundCount >= diff {
+					stats.SoundCount -= diff
+				}
+			}
+		}
+		
+		df.Logger.Infof("Soundness Check Statistics:")
+		df.Logger.Infof("\tTotal summaries checked: %d", stats.TotalSummaries)
+		df.Logger.Infof("\tSound summaries: %d", stats.SoundCount)
+		df.Logger.Infof("\tUnsound summaries: %d", stats.UnsoundCount)
+		if len(stats.StepDistribution) > 0 {
+			df.Logger.Infof("\tSound summaries proven at step:")
+			// Print steps in order: Step1, Step2, Step3, Step4, Step5, then others
+			stepOrder := []string{"Step1", "Step2", "Step3", "Step4", "Step5", "Cached", "Cycle", "DepthLimit", "Other"}
+			for _, step := range stepOrder {
+				if count, ok := stats.StepDistribution[step]; ok && count > 0 {
+					df.Logger.Infof("\t\t%s: %d", step, count)
+				}
+			}
+			// Print any remaining steps not in the predefined order
+			for step, count := range stats.StepDistribution {
+				found := false
+				for _, predefined := range stepOrder {
+					if step == predefined {
+						found = true
+						break
+					}
+				}
+				if !found && count > 0 {
+					df.Logger.Infof("\t\t%s: %d", step, count)
+				}
+			}
+		}
+		df.Logger.Infof("")
+	}
 
 	if len(unsoundSummaries) == 0 {
 		df.Logger.Infof(
