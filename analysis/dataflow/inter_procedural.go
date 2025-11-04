@@ -82,6 +82,14 @@ type RecursiveCheckResults struct {
 	FirstFailureReason string // Reason for first failure (if any)
 }
 
+// SoundnessCheckStats tracks statistics about soundness checking results
+type SoundnessCheckStats struct {
+	TotalSummaries   int            // Total number of summaries checked
+	SoundCount       int            // Number of sound summaries
+	UnsoundCount     int            // Number of unsound summaries
+	StepDistribution map[string]int // Distribution of which step proved soundness (step name -> count)
+}
+
 // InterProceduralFlowGraph represents an inter-procedural data flow graph.
 type InterProceduralFlowGraph struct {
 	// ForwardEdges represents edges between nodes belonging to different sub-graphs (inter-procedural version of
@@ -981,11 +989,47 @@ func (g *InterProceduralFlowGraph) CheckSummarySoundness(
 	return g.checkSummarySoundnessStepwise(function, summaryUnderCheck, 0, visited, cache)
 }
 
+// extractStepFromReason extracts the step name from a soundness check reason string.
+// Returns the step name (e.g., "Step1", "Step2", etc.) or "Other" if not recognized.
+func extractStepFromReason(reason string) string {
+	// Check for step-specific patterns
+	if strings.Contains(reason, "equals full-flow") {
+		return "Step1"
+	}
+	if strings.Contains(reason, "type-infeasible") {
+		return "Step2"
+	}
+	if strings.Contains(reason, "immutability") {
+		return "Step3"
+	}
+	if strings.Contains(reason, "reaching") {
+		return "Step4"
+	}
+	if strings.Contains(reason, "subspec") || strings.Contains(reason, "leaf intra subset") || strings.Contains(reason, "external subset") {
+		return "Step5"
+	}
+	if strings.Contains(reason, "cached") {
+		return "Cached"
+	}
+	if strings.Contains(reason, "cycle") {
+		return "Cycle"
+	}
+	if strings.Contains(reason, "depth cap") {
+		return "DepthLimit"
+	}
+	return "Other"
+}
+
 // CheckExternalSummaries is a wrapper around CheckSummarySoundness to check all external summaries.
-func (g *InterProceduralFlowGraph) CheckExternalSummaries() ([]*SummaryGraph, error) {
+// It returns both the unsound summaries and statistics about the checking process.
+func (g *InterProceduralFlowGraph) CheckExternalSummaries() ([]*SummaryGraph, *SoundnessCheckStats, error) {
 	var unsoundSummaries []*SummaryGraph
 	if !g.IsBuilt() {
 		unsoundSummaries = g.BuildGraph()
+	}
+
+	stats := &SoundnessCheckStats{
+		StepDistribution: make(map[string]int),
 	}
 
 	var checkedFns = make(map[*ssa.Function]bool)
@@ -993,8 +1037,10 @@ func (g *InterProceduralFlowGraph) CheckExternalSummaries() ([]*SummaryGraph, er
 	// Check all summaries that are part of the call graph
 	for function, summary := range g.Summaries {
 		if summary.IsExternal() {
+			stats.TotalSummaries++
 			isSound, reason, _ := g.CheckSummarySoundness(function, summary)
 			if !isSound {
+				stats.UnsoundCount++
 				// avoid duplicates
 				isNew := true
 				for _, unsound := range unsoundSummaries {
@@ -1007,12 +1053,16 @@ func (g *InterProceduralFlowGraph) CheckExternalSummaries() ([]*SummaryGraph, er
 					unsoundSummaries = append(unsoundSummaries, summary)
 				}
 				g.AnalyzerState.Logger.Warnf("Unsound external summary for %s: %s", function.String(), reason)
+			} else {
+				stats.SoundCount++
+				step := extractStepFromReason(reason)
+				stats.StepDistribution[step]++
 			}
 			checkedFns[function] = true
 		}
 	}
 
-	return unsoundSummaries, nil
+	return unsoundSummaries, stats, nil
 }
 
 // checkSummarySoundnessRecursive is the internal recursive implementation that checks soundness
