@@ -1036,7 +1036,7 @@ func (g *InterProceduralFlowGraph) CheckExternalSummaries() ([]*SummaryGraph, *S
 
 	// Check all summaries that are part of the call graph
 	for function, summary := range g.Summaries {
-		if summary.IsExternal() {
+		if summary.IsPreSummarized {
 			stats.TotalSummaries++
 			isSound, reason, _ := g.CheckSummarySoundness(function, summary)
 			if !isSound {
