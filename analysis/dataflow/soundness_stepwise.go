@@ -5,6 +5,7 @@ import (
 	"go/types"
 	"strings"
 
+	"github.com/awslabs/ar-go-tools/internal/pointer"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -228,8 +229,8 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 			if tp, ok2 := mp.Target.(*ParamNode); ok2 {
 				// Use CanPoint logic to check if types are pointer-like
 				if st != nil && dt != nil {
-					srcCanPoint := g.canPoint(st)
-					dstCanPoint := g.canPoint(dt)
+					srcCanPoint := pointer.CanPoint(st)
+					dstCanPoint := pointer.CanPoint(dt)
 
 					if !srcCanPoint && !dstCanPoint {
 						if g.AnalyzerState.Logger.LogsDebug() {
@@ -263,20 +264,6 @@ func (g *InterProceduralFlowGraph) filterMissingSimpleType(missing []NodePair) [
 	return out
 }
 
-// canPoint reports whether the type T is pointerlike, for the purposes of this analysis.
-// This is a local wrapper around pointer.CanPoint to avoid import issues.
-func (g *InterProceduralFlowGraph) canPoint(T types.Type) bool {
-	switch T := T.(type) {
-	case *types.Named:
-		if obj := T.Obj(); obj.Name() == "Value" && obj.Pkg().Path() == "reflect" {
-			return true // treat reflect.Value like interface{}
-		}
-		return g.canPoint(T.Underlying())
-	case *types.Pointer, *types.Interface, *types.Map, *types.Chan, *types.Signature, *types.Slice:
-		return true
-	}
-	return false // array struct tuple builtin basic
-}
 func (g *InterProceduralFlowGraph) nodeType(n GraphNode) types.Type {
 	switch x := n.(type) {
 	case *ParamNode:
@@ -344,12 +331,226 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 		return missing
 	}
 
-	// --- Step 3.1: Identify parameters that are never modified (written to) ---
-	// This includes checking for stores to aliases of the parameter.
+	// Check if pointer analysis is available
+	if g.AnalyzerState == nil || g.AnalyzerState.PointerAnalysis == nil {
+		if g.AnalyzerState != nil && g.AnalyzerState.Logger.LogsDebug() {
+			g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] func=%s fallback to simple analysis (no pointer analysis)", function.String())
+		}
+		return g.filterMissingImmutabilitySimple(function, missing)
+	}
+
+	// --- Step 3.1: Identify parameters that are never modified using pointer analysis ---
 	unmodifiedParams := make(map[int]bool)
 	for i, p := range function.Params {
-		// A simple alias analysis: find all values derived from the parameter.
-		// A more robust analysis would use a proper pointer analysis library.
+		isModified := g.isParameterModifiedViaPointerAnalysis(p, function)
+		if !isModified {
+			unmodifiedParams[i] = true
+		}
+	}
+
+	// --- Step 3.2: Identify parameters that are never read using pointer analysis ---
+	unusedParams := make(map[int]bool)
+	for i, p := range function.Params {
+		isRead := g.isParameterReadViaPointerAnalysis(p, function)
+		if !isRead {
+			unusedParams[i] = true
+		}
+	}
+
+	// --- Step 3.3: Filter missing flows ---
+	var out []NodePair
+	for _, mp := range missing {
+		if src, ok := mp.Source.(*ParamNode); ok {
+			if unusedParams[src.argPos] {
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] drop %s -> %s (source unused via pointer analysis)", mp.Source.String(), mp.Target.String())
+				}
+				continue
+			}
+		}
+		if tgt, ok := mp.Target.(*ParamNode); ok {
+			if unmodifiedParams[tgt.argPos] {
+				if g.AnalyzerState.Logger.LogsDebug() {
+					g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] drop %s -> %s (target unmodified via pointer analysis)", mp.Source.String(), mp.Target.String())
+				}
+				continue
+			}
+		}
+		out = append(out, mp)
+	}
+	return out
+}
+
+// isParameterModifiedViaPointerAnalysis uses pointer analysis to determine if a parameter is modified
+func (g *InterProceduralFlowGraph) isParameterModifiedViaPointerAnalysis(param ssa.Value, function *ssa.Function) bool {
+	// Get the points-to set for the parameter
+	paramAliases := g.getParameterAliasesViaPointerAnalysis(param)
+
+	// Check all instructions in the function for modifications to any alias
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			if store, ok := instr.(*ssa.Store); ok {
+				// Check if store address could alias the parameter
+				storeAddr := store.Addr
+				if g.valuesCouldAlias(param, storeAddr, paramAliases) {
+					return true
+				}
+			}
+
+			// Check for modification via function call (conservative)
+			if call, ok := instr.(ssa.CallInstruction); ok {
+				for _, arg := range call.Common().Args {
+					if g.valuesCouldAlias(param, arg, paramAliases) {
+						// Treat pointer-like arguments as potentially modifiable by calls
+						if pointer.CanPoint(arg.Type()) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// isParameterReadViaPointerAnalysis uses pointer analysis to determine if a parameter is read
+func (g *InterProceduralFlowGraph) isParameterReadViaPointerAnalysis(param ssa.Value, function *ssa.Function) bool {
+	paramAliases := g.getParameterAliasesViaPointerAnalysis(param)
+
+	// Check all instructions in the function for reads of any alias
+	for _, block := range function.Blocks {
+		for _, instr := range block.Instrs {
+			// Check store values (reading from parameter)
+			if store, ok := instr.(*ssa.Store); ok {
+				if g.valuesCouldAlias(param, store.Val, paramAliases) {
+					return true
+				}
+			}
+
+			// Check dereference operations
+			if uop, ok := instr.(*ssa.UnOp); ok {
+				if g.valuesCouldAlias(param, uop.X, paramAliases) {
+					return true
+				}
+			}
+
+			// Check function call arguments
+			if call, ok := instr.(ssa.CallInstruction); ok {
+				for _, arg := range call.Common().Args {
+					if g.valuesCouldAlias(param, arg, paramAliases) {
+						return true
+					}
+				}
+			}
+
+			// Check return statements
+			if ret, ok := instr.(*ssa.Return); ok {
+				for _, rv := range ret.Results {
+					if g.valuesCouldAlias(param, rv, paramAliases) {
+						return true
+					}
+				}
+			}
+
+			// Check phi nodes
+			if phi, ok := instr.(*ssa.Phi); ok {
+				for _, edge := range phi.Edges {
+					if g.valuesCouldAlias(param, edge, paramAliases) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// getParameterAliasesViaPointerAnalysis collects all values that might alias with the parameter
+func (g *InterProceduralFlowGraph) getParameterAliasesViaPointerAnalysis(param ssa.Value) map[ssa.Value]bool {
+	aliases := make(map[ssa.Value]bool)
+	aliases[param] = true
+
+	// Get direct pointer information
+	if ptr, exists := g.AnalyzerState.PointerAnalysis.Queries[param]; exists {
+		// For each label in the points-to set, find other values that point to the same locations
+		paramLabels := make(map[*pointer.Label]bool)
+		for _, label := range ptr.PointsTo().Labels() {
+			paramLabels[label] = true
+		}
+
+		// Find other values with overlapping points-to sets
+		for value, otherPtr := range g.AnalyzerState.PointerAnalysis.Queries {
+			if value == param {
+				continue
+			}
+			for _, label := range otherPtr.PointsTo().Labels() {
+				if paramLabels[label] {
+					aliases[value] = true
+					break
+				}
+			}
+		}
+	}
+
+	// Get indirect pointer information
+	if ptr, exists := g.AnalyzerState.PointerAnalysis.IndirectQueries[param]; exists {
+		paramLabels := make(map[*pointer.Label]bool)
+		for _, label := range ptr.PointsTo().Labels() {
+			paramLabels[label] = true
+		}
+
+		for value, otherPtr := range g.AnalyzerState.PointerAnalysis.IndirectQueries {
+			if value == param {
+				continue
+			}
+			for _, label := range otherPtr.PointsTo().Labels() {
+				if paramLabels[label] {
+					aliases[value] = true
+					break
+				}
+			}
+		}
+	}
+
+	return aliases
+}
+
+// valuesCouldAlias checks if two values could alias based on pointer analysis
+func (g *InterProceduralFlowGraph) valuesCouldAlias(val1, val2 ssa.Value, val1Aliases map[ssa.Value]bool) bool {
+	if val1 == val2 {
+		return true
+	}
+
+	// Check if val2 is in the precomputed aliases of val1
+	if val1Aliases[val2] {
+		return true
+	}
+
+	// Check direct pointer analysis queries
+	if ptr1, exists1 := g.AnalyzerState.PointerAnalysis.Queries[val1]; exists1 {
+		if ptr2, exists2 := g.AnalyzerState.PointerAnalysis.Queries[val2]; exists2 {
+			// Check if points-to sets intersect
+			labels1 := make(map[*pointer.Label]bool)
+			for _, label := range ptr1.PointsTo().Labels() {
+				labels1[label] = true
+			}
+			for _, label := range ptr2.PointsTo().Labels() {
+				if labels1[label] {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// filterMissingImmutabilitySimple is the fallback implementation when pointer analysis is not available
+func (g *InterProceduralFlowGraph) filterMissingImmutabilitySimple(function *ssa.Function, missing []NodePair) []NodePair {
+	// --- Step 3.1: Identify parameters that are never modified (written to) using simple analysis ---
+	unmodifiedParams := make(map[int]bool)
+	for i, p := range function.Params {
+		// Simple alias analysis: find all values derived from the parameter
 		q := []ssa.Value{p}
 		visited := map[ssa.Value]bool{p: true}
 		isModified := false
@@ -402,8 +603,7 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 		}
 	}
 
-	// --- Step 3.2: Identify parameters that are never read (used) ---
-	// More precise than just "has referrers": recognize actual read uses.
+	// --- Step 3.2: Identify parameters that are never read using simple analysis ---
 	unusedParams := make(map[int]bool)
 	for i, p := range function.Params {
 		isRead := false
@@ -427,7 +627,6 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 				}
 				// Dereference read: *v
 				if uop, ok := instr.(*ssa.UnOp); ok {
-					// token.MUL indicates dereference of address held in X
 					if uop.X == v {
 						isRead = true
 						break
@@ -488,7 +687,7 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 	for _, mp := range missing {
 		if src, ok := mp.Source.(*ParamNode); ok {
 			if unusedParams[src.argPos] {
-				if g.AnalyzerState.Logger.LogsDebug() {
+				if g.AnalyzerState != nil && g.AnalyzerState.Logger.LogsDebug() {
 					g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] drop %s -> %s (source unused)", mp.Source.String(), mp.Target.String())
 				}
 				continue
@@ -496,7 +695,7 @@ func (g *InterProceduralFlowGraph) filterMissingImmutability(function *ssa.Funct
 		}
 		if tgt, ok := mp.Target.(*ParamNode); ok {
 			if unmodifiedParams[tgt.argPos] {
-				if g.AnalyzerState.Logger.LogsDebug() {
+				if g.AnalyzerState != nil && g.AnalyzerState.Logger.LogsDebug() {
 					g.AnalyzerState.Logger.Debugf("[STEP3: IMMUTABLE] drop %s -> %s (target unmodified)", mp.Source.String(), mp.Target.String())
 				}
 				continue
